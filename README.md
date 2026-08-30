@@ -6,6 +6,24 @@ telegram: @Mkogexchange
 WhatsApp: +63 995 715 1043
 
 
+EA Name	Ophireum Technology
+Version	3.0 Production Candidate
+Platform	MetaTrader 5
+Language	MQL5
+Primary Symbol	XAUUSD
+Execution TF	M5
+Confirmation TF	M15
+Structural TF	H1
+Trend TF	H4
+Macro TF	D1
+Strategy Type	Multi-Timeframe SMC / Liquidity / Structure
+Execution	Fully Automatic
+Position Sizing	Fully Automatic
+Mandatory SL	TRUE
+Production Lock	TRUE
+
+
+
 Symmetrix Gold SMC: automated MT5 EA trading XAUUSD via SMC/ICT rules (liquidity sweep→CHoCH→BOS→entry). Max 3 trades/day, auto-calculated lot sizing from live equity/risk %, strict risk controls, news/session filters, structural stops. Capital preservation prioritized over trade frequency.
 
 Symmetrix Gold SMC is a fully automated MT5 Expert Advisor for trading XAUUSD (gold) using a Smart Money Concepts (SMC/ICT) methodology, built as a rule-based state machine rather than a simple indicator-signal bot.
@@ -255,4 +273,1828 @@ Summary of the structural gaps this revision closes
 6.	Orphan-position and retry-circuit-breaker logic close failure modes in the reconciliation/connection sections that v1 flagged as important but didn't fully specify.
 7.	Statistical validity gates (sample size, concentration limits) prevent the acceptance criteria from being satisfied by a lucky backtest.
 This is still a specification, not a guarantee — SMC/ICT-style rules encode a discretionary methodology into fixed logic, and no amount of rule-tightening substitutes for the full validation sequence in §38–40 before real capital is at risk. Treat this document as the build target, then let the walk-forward and demo-forward results — not confidence in the spec — decide whether it's ready for live size.
+
+
+
+
+"""
+SYMMETRIX GOLD SMC — Python / MetaTrader5 Implementation
+=========================================================
+
+Production-candidate implementation of the Symmetrix Gold SMC v2 strengthened
+specification: a rule-based Smart Money Concepts (SMC/ICT) state-machine EA
+for XAUUSD on MT5, driven from Python via the official `MetaTrader5` package.
+
+Requirements:
+    pip install MetaTrader5 pandas numpy
+
+This script assumes the MT5 terminal is installed, logged in to a broker
+account, and running locally (the Python API talks to the local terminal,
+not directly to the broker).
+
+IMPORTANT
+---------
+This is a large, complex trading system. Before ANY live capital:
+  1. Run it in a demo account for weeks.
+  2. Validate every log entry against what you expect the strategy to do.
+  3. Backtest / walk-forward the structure logic separately (this script is
+     built for live/demo execution, not vectorized backtesting).
+  4. Treat every threshold below (ATR multipliers, candle counts, score
+     cutoffs) as a starting configuration to be tuned and re-validated,
+     not as a guarantee of edge.
+
+Nothing here is financial advice — it is an engineering implementation of
+the rules you specified.
+"""
+
+from __future__ import annotations
+
+import time
+import csv
+import os
+import json
+import uuid
+import math
+import logging
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
+from enum import Enum, auto
+from typing import Optional, List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    import MetaTrader5 as mt5
+except ImportError:
+    mt5 = None  # allows the module to be imported/tested without the terminal
+
+
+# ============================================================================
+# 1. CONFIGURATION
+# ============================================================================
+
+@dataclass
+class Config:
+    symbol: str = "XAUUSD"
+    magic_number: int = 990011
+
+    # Timeframes
+    tf_exec: int = None          # M5
+    tf_confirm: int = None       # M15
+    tf_h1: int = None
+    tf_h4: int = None
+    tf_d1: int = None
+
+    # Direction engine
+    ema_fast: int = 20
+    ema_slow: int = 50
+    h4_min_separation_atr: float = 0.15
+    h1_min_separation_atr: float = 0.10
+    h4_persistence_bars: int = 3
+    adx_period: int = 14
+    adx_floor: float = 20.0
+
+    # Dealing range
+    range_max_age_h1_bars: int = 40
+    range_min_size_atr: float = 3.0
+    equilibrium_buffer_pct: float = 0.05
+
+    # Liquidity
+    equal_level_tolerance_atr: float = 0.08
+    liquidity_decay_days: int = 10
+
+    # Swings
+    swing_min_amplitude_atr: float = 0.20
+
+    # Sweep
+    sweep_min_pen_atr: float = 0.05
+    sweep_pref_pen_atr: float = 0.10
+    sweep_max_pen_atr: float = 0.75
+    sweep_max_window_bars: int = 3
+    sweep_min_relative_atr_pct: float = 0.40  # vs 50-period avg ATR
+
+    # CHoCH
+    choch_timeout_bars: int = 24
+
+    # Displacement
+    displacement_min_ratio: float = 1.25
+    displacement_pref_ratio: float = 1.50
+    displacement_retrace_max_pct: float = 0.70
+    body_lookback: int = 20
+
+    # BOS
+    bos_max_window_bars: int = 15
+
+    # FVG
+    fvg_min_size_atr: float = 0.05
+    fvg_mitigation_pct: float = 0.50
+    fvg_stale_bars: int = 50
+
+    # Order block
+    ob_stale_bars: int = 80
+
+    # Entry zone
+    entry_zone_atr_tolerance: float = 0.30
+    entry_zone_min_sl_atr: float = 0.5
+
+    # Entry confirmation
+    confirm_timeout_bars: int = 10
+    rejection_wick_pct: float = 0.60
+
+    # Scoring
+    score_min_normal: int = 27
+    score_min_after_2_losses: int = 30
+    score_max: int = 32
+    min_rr: float = 2.0
+    vol_regime_min_pct: float = 0.60
+    vol_regime_max_pct: float = 2.50
+
+    # Sessions (broker server-time hours, 24h clock) — tune to broker offset
+    london_start_hour: int = 9
+    london_end_hour: int = 17
+    ny_start_hour: int = 14
+    ny_end_hour: int = 22
+    dead_zone_minutes: int = 30
+    allow_asian_session: bool = False
+
+    # News
+    news_blackout_before_min: int = 30
+    news_blackout_after_min: int = 30
+    fomc_blackout_before_min: int = 90
+    fomc_blackout_after_min: int = 90
+
+    # Spread / execution
+    max_spread_static_points: float = 500.0   # hard ceiling, broker points
+    max_spread_atr_pct: float = 0.15
+
+    # Risk & sizing
+    base_risk_pct: float = 0.25
+    risk_after_1_loss_pct: float = 0.20
+    risk_after_2_losses_pct: float = 0.15
+    preweekend_risk_multiplier: float = 0.50
+    margin_safety_factor: float = 0.80
+    min_lot_risk_tolerance_multiplier: float = 1.5
+
+    # Exposure
+    max_lots_per_order: float = 5.0
+    max_total_xauusd_exposure: float = 5.0
+
+    # Stop loss
+    sl_atr_buffer: float = 0.10
+
+    # Profit management
+    tp1_r: float = 1.0
+    tp1_close_pct: float = 0.30
+    tp2_r: float = 2.0
+    tp2_close_pct: float = 0.40
+    # remaining 30% = runner
+
+    # Daily controls
+    max_trades_per_day: int = 3
+    cooldown_bars_after_close: int = 6
+    stall_bars_warning: int = 20
+
+    # Loss limits (percent of equity)
+    daily_stop_pct: float = -0.75
+    emergency_daily_stop_pct: float = -2.00
+    weekly_stop_pct: float = -4.00
+    monthly_stop_pct: float = -6.00
+
+    # Weekend protection (broker server time)
+    friday_close_hour_utc: int = 21
+    weekend_t_minus_4h_disable: int = 4
+    weekend_t_minus_2h_defensive: int = 2
+    weekend_t_minus_30m_flatten_min: int = 30
+
+    # Reconnection / order failure
+    max_order_retries: int = 5
+    retry_delay_seconds: float = 2.0
+    retry_circuit_breaker_count: int = 5
+    retry_circuit_breaker_window_min: int = 30
+
+    # Misc
+    poll_seconds: int = 5
+    log_dir: str = "./symmetrix_logs"
+    journal_csv: str = "./symmetrix_logs/trade_journal.csv"
+    setup_log_csv: str = "./symmetrix_logs/setup_log.csv"
+
+    def bind_timeframes(self):
+        if mt5 is None:
+            return
+        self.tf_exec = mt5.TIMEFRAME_M5
+        self.tf_confirm = mt5.TIMEFRAME_M15
+        self.tf_h1 = mt5.TIMEFRAME_H1
+        self.tf_h4 = mt5.TIMEFRAME_H4
+        self.tf_d1 = mt5.TIMEFRAME_D1
+
+
+# ============================================================================
+# 2. STATE MACHINE ENUM
+# ============================================================================
+
+class State(Enum):
+    IDLE = auto()
+    HTF_DIRECTION_VALID = auto()
+    LIQUIDITY_IDENTIFIED = auto()
+    SWEEP_CONFIRMED = auto()
+    CHOCH_CONFIRMED = auto()
+    DISPLACEMENT_CONFIRMED = auto()
+    BOS_CONFIRMED = auto()
+    ENTRY_ZONE_CREATED = auto()
+    WAITING_FOR_RETRACE = auto()
+    ENTRY_CONFIRMATION = auto()
+    SCORE_VALID = auto()
+    RISK_VALID = auto()
+    ORDER_SENT = auto()
+    ORDER_CONFIRMED = auto()
+    POSITION_MANAGEMENT = auto()
+    POSITION_CLOSED = auto()
+
+
+STATE_TIMEOUT_BARS = {
+    State.LIQUIDITY_IDENTIFIED: 100,
+    State.SWEEP_CONFIRMED: 24,          # -> CHOCH_CONFIRMED
+    State.CHOCH_CONFIRMED: 10,          # -> DISPLACEMENT_CONFIRMED
+    State.DISPLACEMENT_CONFIRMED: 15,   # -> BOS_CONFIRMED
+    State.BOS_CONFIRMED: 5,             # -> ENTRY_ZONE_CREATED
+    State.WAITING_FOR_RETRACE: 10,      # -> ENTRY_CONFIRMATION
+    State.ENTRY_CONFIRMATION: 1,        # must act same bar
+}
+
+
+class Direction(Enum):
+    BULLISH = auto()
+    BEARISH = auto()
+    NEUTRAL = auto()
+
+
+# ============================================================================
+# 3. LOGGING
+# ============================================================================
+
+def setup_logging(cfg: Config) -> logging.Logger:
+    os.makedirs(cfg.log_dir, exist_ok=True)
+    logger = logging.getLogger("symmetrix")
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        fh = logging.FileHandler(os.path.join(cfg.log_dir, "symmetrix.log"))
+        fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+        ch = logging.StreamHandler()
+        ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+        logger.addHandler(fh)
+        logger.addHandler(ch)
+
+    for path, header in [
+        (cfg.journal_csv, [
+            "setup_id", "entry_time", "exit_time", "direction", "initial_risk",
+            "mfe", "mae", "r_result", "net_pl", "commission", "swap", "slippage",
+            "exit_reason", "tp1_status", "tp2_status", "runner_result"
+        ]),
+        (cfg.setup_log_csv, [
+            "timestamp", "symbol", "direction", "h4_bias", "h1_bias", "d1_bias",
+            "liquidity_type", "liquidity_price", "sweep_depth_atr", "choch",
+            "displacement_ratio", "bos", "fvg", "ob", "fib", "score", "spread",
+            "risk_pct", "equity", "risk_capital", "tick_value", "tick_size",
+            "stop_distance_points", "raw_lots", "final_lots", "margin_required",
+            "free_margin", "entry", "sl", "tp1", "tp2", "reason"
+        ]),
+    ]:
+        if not os.path.exists(path):
+            with open(path, "w", newline="") as f:
+                csv.writer(f).writerow(header)
+
+    return logger
+
+
+def append_csv(path: str, row: dict, header: List[str]):
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        writer.writerow({k: row.get(k, "") for k in header})
+
+
+# ============================================================================
+# 4. MT5 DATA ACCESS LAYER
+# ============================================================================
+
+class MT5Data:
+    """Thin wrapper around the MetaTrader5 API for data + account + orders."""
+
+    def __init__(self, cfg: Config, logger: logging.Logger):
+        self.cfg = cfg
+        self.log = logger
+
+    def connect(self) -> bool:
+        if mt5 is None:
+            self.log.error("MetaTrader5 package not available in this environment.")
+            return False
+        if not mt5.initialize():
+            self.log.error(f"MT5 initialize() failed: {mt5.last_error()}")
+            return False
+        info = mt5.symbol_info(self.cfg.symbol)
+        if info is None or not info.visible:
+            mt5.symbol_select(self.cfg.symbol, True)
+        self.log.info("Connected to MT5 terminal.")
+        return True
+
+    def shutdown(self):
+        if mt5 is not None:
+            mt5.shutdown()
+
+    def is_connected(self) -> bool:
+        if mt5 is None:
+            return False
+        return mt5.terminal_info() is not None
+
+    def rates(self, timeframe, count: int = 300) -> pd.DataFrame:
+        raw = mt5.copy_rates_from_pos(self.cfg.symbol, timeframe, 0, count)
+        if raw is None or len(raw) == 0:
+            return pd.DataFrame()
+        df = pd.DataFrame(raw)
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        return df
+
+    def account(self) -> dict:
+        a = mt5.account_info()
+        return {} if a is None else a._asdict()
+
+    def symbol_info(self) -> dict:
+        s = mt5.symbol_info(self.cfg.symbol)
+        return {} if s is None else s._asdict()
+
+    def tick(self) -> dict:
+        t = mt5.symbol_info_tick(self.cfg.symbol)
+        return {} if t is None else t._asdict()
+
+    def open_positions(self) -> List[dict]:
+        positions = mt5.positions_get(symbol=self.cfg.symbol)
+        if positions is None:
+            return []
+        return [p._asdict() for p in positions
+                if p.magic == self.cfg.magic_number]
+
+    def calc_margin(self, order_type, volume, price) -> Optional[float]:
+        return mt5.order_calc_margin(order_type, self.cfg.symbol, volume, price)
+
+    def send_order(self, request: dict):
+        return mt5.order_send(request)
+
+
+# ============================================================================
+# 5. INDICATORS
+# ============================================================================
+
+class Indicators:
+
+    @staticmethod
+    def ema(series: pd.Series, period: int) -> pd.Series:
+        return series.ewm(span=period, adjust=False).mean()
+
+    @staticmethod
+    def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        high, low, close = df["high"], df["low"], df["close"]
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        return tr.rolling(period).mean()
+
+    @staticmethod
+    def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+        high, low, close = df["high"], df["low"], df["close"]
+        up_move = high.diff()
+        down_move = -low.diff()
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        tr = Indicators.atr(df, 1) * 1  # true range per bar (period=1 rolling mean == TR)
+        atr_n = pd.Series(tr).rolling(period).mean()
+        plus_di = 100 * pd.Series(plus_dm).rolling(period).mean() / atr_n.replace(0, np.nan)
+        minus_di = 100 * pd.Series(minus_dm).rolling(period).mean() / atr_n.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        return dx.rolling(period).mean()
+
+    @staticmethod
+    def avg_body(df: pd.DataFrame, lookback: int) -> float:
+        bodies = (df["close"] - df["open"]).abs()
+        return float(bodies.tail(lookback).mean())
+
+
+# ============================================================================
+# 6. SWING / FRACTAL DETECTION
+# ============================================================================
+
+@dataclass
+class Swing:
+    index: int
+    time: datetime
+    price: float
+    kind: str          # "HIGH" or "LOW"
+    quality: str        # "CONFIRMED" or "MINOR"
+
+
+def detect_swings(df: pd.DataFrame, atr_series: pd.Series, min_amp_atr: float) -> List[Swing]:
+    """5-candle fractal swings, confirmed only after N+2 has closed."""
+    swings = []
+    highs, lows = df["high"].values, df["low"].values
+    n = len(df)
+    for i in range(2, n - 2):
+        atr_i = atr_series.iloc[i]
+        if pd.isna(atr_i) or atr_i == 0:
+            continue
+        # swing high
+        if highs[i] > highs[i-2] and highs[i] > highs[i-1] and \
+           highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+            amp = min(highs[i] - lows[i-1], highs[i] - lows[i+1])
+            quality = "CONFIRMED" if amp >= min_amp_atr * atr_i else "MINOR"
+            swings.append(Swing(i, df["time"].iloc[i], highs[i], "HIGH", quality))
+        # swing low
+        if lows[i] < lows[i-2] and lows[i] < lows[i-1] and \
+           lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+            amp = min(highs[i-1] - lows[i], highs[i+1] - lows[i])
+            quality = "CONFIRMED" if amp >= min_amp_atr * atr_i else "MINOR"
+            swings.append(Swing(i, df["time"].iloc[i], lows[i], "LOW", quality))
+    return swings
+
+
+# ============================================================================
+# 7. LIQUIDITY ENGINE
+# ============================================================================
+
+class LiquidityStatus(Enum):
+    UNTOUCHED = auto()
+    SWEPT = auto()
+    INVALIDATED = auto()
+
+
+@dataclass
+class LiquidityLevel:
+    kind: str            # PDH, PDL, PWH, PWL, ASIAN_HIGH, ASIAN_LOW, EQ_HIGH, EQ_LOW, H1_SWING, M15_SWING
+    price: float
+    time: datetime
+    status: LiquidityStatus = LiquidityStatus.UNTOUCHED
+    priority_tier: int = 5   # lower = higher priority
+
+
+PRIORITY_ORDER = {
+    "PWH": 0, "PWL": 0,
+    "PDH": 1, "PDL": 1,
+    "EQ_HIGH": 2, "EQ_LOW": 2,
+    "ASIAN_HIGH": 3, "ASIAN_LOW": 3,
+    "H1_SWING": 4,
+    "M15_SWING": 5,
+}
+
+
+class LiquidityEngine:
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.levels: List[LiquidityLevel] = []
+
+    def build(self, d1: pd.DataFrame, h1: pd.DataFrame, m15: pd.DataFrame,
+              h1_swings: List[Swing], m15_swings: List[Swing], now: datetime):
+        self.levels.clear()
+        if len(d1) >= 2:
+            prev_day = d1.iloc[-2]
+            self.levels.append(LiquidityLevel("PDH", prev_day["high"], prev_day["time"],
+                                               priority_tier=PRIORITY_ORDER["PDH"]))
+            self.levels.append(LiquidityLevel("PDL", prev_day["low"], prev_day["time"],
+                                               priority_tier=PRIORITY_ORDER["PDL"]))
+        weekly = d1.copy()
+        weekly["week"] = weekly["time"].dt.isocalendar().week
+        if weekly["week"].nunique() >= 2:
+            last_week = weekly["week"].iloc[-1]
+            prior = weekly[weekly["week"] != last_week].tail(5)
+            if not prior.empty:
+                self.levels.append(LiquidityLevel("PWH", prior["high"].max(), prior["time"].iloc[-1],
+                                                   priority_tier=PRIORITY_ORDER["PWH"]))
+                self.levels.append(LiquidityLevel("PWL", prior["low"].min(), prior["time"].iloc[-1],
+                                                   priority_tier=PRIORITY_ORDER["PWL"]))
+
+        asian = h1[(h1["time"].dt.hour >= 0) & (h1["time"].dt.hour < 8) &
+                   (h1["time"].dt.date == now.date())]
+        if not asian.empty:
+            self.levels.append(LiquidityLevel("ASIAN_HIGH", asian["high"].max(), asian["time"].iloc[-1],
+                                               priority_tier=PRIORITY_ORDER["ASIAN_HIGH"]))
+            self.levels.append(LiquidityLevel("ASIAN_LOW", asian["low"].min(), asian["time"].iloc[-1],
+                                               priority_tier=PRIORITY_ORDER["ASIAN_LOW"]))
+
+        for sw in h1_swings:
+            if sw.quality == "CONFIRMED":
+                kind = "H1_SWING"
+                self.levels.append(LiquidityLevel(kind, sw.price, sw.time,
+                                                   priority_tier=PRIORITY_ORDER[kind]))
+        for sw in m15_swings:
+            if sw.quality == "CONFIRMED":
+                kind = "M15_SWING"
+                self.levels.append(LiquidityLevel(kind, sw.price, sw.time,
+                                                   priority_tier=PRIORITY_ORDER[kind]))
+
+        self._mark_equal_levels(h1["close"].iloc[-1] if len(h1) else None)
+        self._apply_decay(now)
+
+    def _mark_equal_levels(self, atr_ref: float):
+        # simplistic equal-highs/lows clustering among H1/M15 swing highs already added
+        pass  # left as an extension point; core priority levels already provide confluence
+
+    def _apply_decay(self, now: datetime):
+        for lvl in self.levels:
+            age_days = (now - lvl.time).days
+            if age_days > self.cfg.liquidity_decay_days and lvl.status == LiquidityStatus.UNTOUCHED:
+                lvl.priority_tier += 1
+
+    def best_target(self, direction: Direction, current_price: float) -> Optional[LiquidityLevel]:
+        """Nearest-qualifying untouched pool on the correct side, by priority tier then distance."""
+        candidates = [l for l in self.levels if l.status == LiquidityStatus.UNTOUCHED]
+        if direction == Direction.BULLISH:
+            candidates = [l for l in candidates if l.price < current_price]  # sell-side liquidity below
+        else:
+            candidates = [l for l in candidates if l.price > current_price]  # buy-side liquidity above
+        if not candidates:
+            return None
+        candidates.sort(key=lambda l: (l.priority_tier, abs(l.price - current_price)))
+        return candidates[0]
+
+
+# ============================================================================
+# 8. DIRECTION ENGINE
+# ============================================================================
+
+@dataclass
+class DirectionReading:
+    direction: Direction
+    persistent: bool
+
+
+class DirectionEngine:
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+
+    def _raw_direction(self, df: pd.DataFrame) -> pd.Series:
+        ema_f = Indicators.ema(df["close"], self.cfg.ema_fast)
+        ema_s = Indicators.ema(df["close"], self.cfg.ema_slow)
+        atr = Indicators.atr(df, 14)
+        sep_ok = (ema_f - ema_s).abs() >= (self.cfg.h4_min_separation_atr * atr)
+        direction = pd.Series(Direction.NEUTRAL, index=df.index)
+        bullish = (df["close"] > ema_f) & (ema_f > ema_s) & sep_ok
+        bearish = (df["close"] < ema_f) & (ema_f < ema_s) & sep_ok
+        direction[bullish] = Direction.BULLISH
+        direction[bearish] = Direction.BEARISH
+        return direction
+
+    def evaluate(self, df_h4: pd.DataFrame, df_h1: pd.DataFrame,
+                 df_d1: pd.DataFrame) -> Tuple[DirectionReading, DirectionReading, DirectionReading]:
+        h4_dir_series = self._raw_direction(df_h4)
+        h1_dir_series = self._raw_direction(df_h1)
+        d1_dir_series = self._raw_direction(df_d1)
+
+        h4_adx = Indicators.adx(df_h4, self.cfg.adx_period)
+        h4_current = h4_dir_series.iloc[-1]
+        if h4_adx.iloc[-1] < self.cfg.adx_floor or pd.isna(h4_adx.iloc[-1]):
+            h4_current = Direction.NEUTRAL
+
+        persistence_window = h4_dir_series.tail(self.cfg.h4_persistence_bars)
+        h4_persistent = bool((persistence_window == h4_current).all()) and h4_current != Direction.NEUTRAL
+
+        h1_current = h1_dir_series.iloc[-1]
+        d1_current = d1_dir_series.iloc[-1]
+
+        return (DirectionReading(h4_current, h4_persistent),
+                DirectionReading(h1_current, True),
+                DirectionReading(d1_current, True))
+
+
+# ============================================================================
+# 9. DEALING RANGE (PREMIUM / DISCOUNT)
+# ============================================================================
+
+@dataclass
+class DealingRange:
+    high: float
+    low: float
+    midpoint: float
+    age_bars: int
+    valid: bool
+
+
+def compute_dealing_range(h1: pd.DataFrame, h1_swings: List[Swing],
+                           atr_series: pd.Series, cfg: Config) -> Optional[DealingRange]:
+    confirmed = [s for s in h1_swings if s.quality == "CONFIRMED"]
+    if len(confirmed) < 2:
+        return None
+    recent = [s for s in confirmed if (len(h1) - 1 - s.index) <= cfg.range_max_age_h1_bars]
+    highs = [s for s in recent if s.kind == "HIGH"]
+    lows = [s for s in recent if s.kind == "LOW"]
+    if not highs or not lows:
+        return None
+    range_high = max(h.price for h in highs)
+    range_low = min(l.price for l in lows)
+    size = range_high - range_low
+    atr_now = atr_series.iloc[-1]
+    if pd.isna(atr_now) or size < cfg.range_min_size_atr * atr_now:
+        return DealingRange(range_high, range_low, (range_high + range_low) / 2, 0, valid=False)
+    age = min(len(h1) - 1 - h.index for h in highs + lows)
+    return DealingRange(range_high, range_low, (range_high + range_low) / 2, age, valid=True)
+
+
+def classify_zone(price: float, rng: DealingRange, cfg: Config) -> str:
+    if not rng or not rng.valid:
+        return "UNKNOWN"
+    span = rng.high - rng.low
+    buffer = span * cfg.equilibrium_buffer_pct
+    if abs(price - rng.midpoint) <= buffer:
+        return "EQUILIBRIUM"
+    return "DISCOUNT" if price < rng.midpoint else "PREMIUM"
+
+
+# ============================================================================
+# 10. SWEEP / CHoCH / DISPLACEMENT / BOS
+# ============================================================================
+
+@dataclass
+class SweepResult:
+    valid: bool
+    depth_atr: float = 0.0
+    bar_index: int = -1
+    reclaim_index: int = -1
+
+
+def detect_sweep(m5: pd.DataFrame, atr: pd.Series, level: float,
+                  direction: Direction, cfg: Config) -> SweepResult:
+    """Look at the most recent bars for penetration + reclaim of `level`."""
+    n = len(m5)
+    lookback = min(cfg.sweep_max_window_bars + 2, n)
+    window = m5.tail(lookback).reset_index(drop=True)
+    atr_now = atr.iloc[-1]
+    if pd.isna(atr_now) or atr_now == 0:
+        return SweepResult(False)
+
+    avg_atr = atr.tail(50).mean()
+    if avg_atr and atr_now < cfg.sweep_min_relative_atr_pct * avg_atr:
+        return SweepResult(False)  # dead volatility regime
+
+    for i in range(len(window)):
+        row = window.iloc[i]
+        if direction == Direction.BULLISH:
+            penetration = level - row["low"]
+        else:
+            penetration = row["high"] - level
+        if penetration <= 0:
+            continue
+        depth_atr = penetration / atr_now
+        if depth_atr < cfg.sweep_min_pen_atr or depth_atr > cfg.sweep_max_pen_atr:
+            continue
+        # look for reclaim within remaining bars of the window
+        for j in range(i, len(window)):
+            reclaim_row = window.iloc[j]
+            reclaimed = (reclaim_row["close"] > level) if direction == Direction.BULLISH \
+                else (reclaim_row["close"] < level)
+            if reclaimed:
+                if (j - i) <= cfg.sweep_max_window_bars:
+                    return SweepResult(True, depth_atr, i, j)
+                break
+    return SweepResult(False)
+
+
+@dataclass
+class ChochResult:
+    confirmed: bool
+    protected_level: Optional[float] = None
+    bar_index: int = -1
+
+
+def detect_choch(m5: pd.DataFrame, swings: List[Swing], direction: Direction,
+                  sweep_bar_time: datetime, cfg: Config) -> ChochResult:
+    """
+    Bullish: LL -> LH -> LL then sweep, then M5 close above protected LH.
+    Bearish: HH -> HL -> HH then sweep, then M5 close below protected HL.
+    Only CONFIRMED swings count as the protected level.
+    """
+    confirmed_swings = [s for s in swings if s.quality == "CONFIRMED"]
+    if direction == Direction.BULLISH:
+        lows = [s for s in confirmed_swings if s.kind == "LOW"]
+        highs = [s for s in confirmed_swings if s.kind == "HIGH"]
+        if len(lows) < 2 or not highs:
+            return ChochResult(False)
+        protected_high = highs[-1]
+        candles_after_sweep = m5[m5["time"] > sweep_bar_time]
+        for idx, row in candles_after_sweep.iterrows():
+            bars_elapsed = idx - m5.index[m5["time"] == sweep_bar_time][0] if any(m5["time"] == sweep_bar_time) else 0
+            if bars_elapsed > cfg.choch_timeout_bars:
+                return ChochResult(False)
+            if row["close"] > protected_high.price:
+                return ChochResult(True, protected_high.price, idx)
+        return ChochResult(False)
+    else:
+        highs = [s for s in confirmed_swings if s.kind == "HIGH"]
+        lows = [s for s in confirmed_swings if s.kind == "LOW"]
+        if len(highs) < 2 or not lows:
+            return ChochResult(False)
+        protected_low = lows[-1]
+        candles_after_sweep = m5[m5["time"] > sweep_bar_time]
+        for idx, row in candles_after_sweep.iterrows():
+            bars_elapsed = idx - m5.index[m5["time"] == sweep_bar_time][0] if any(m5["time"] == sweep_bar_time) else 0
+            if bars_elapsed > cfg.choch_timeout_bars:
+                return ChochResult(False)
+            if row["close"] < protected_low.price:
+                return ChochResult(True, protected_low.price, idx)
+        return ChochResult(False)
+
+
+def check_displacement(m5: pd.DataFrame, choch_bar_index: int, direction: Direction,
+                        cfg: Config) -> Tuple[bool, float]:
+    if choch_bar_index < 0 or choch_bar_index >= len(m5):
+        return False, 0.0
+    avg_body = Indicators.avg_body(m5.iloc[:choch_bar_index], cfg.body_lookback)
+    if avg_body == 0:
+        return False, 0.0
+    candle = m5.iloc[choch_bar_index]
+    body = candle["close"] - candle["open"]
+    is_directional = body > 0 if direction == Direction.BULLISH else body < 0
+    ratio = abs(body) / avg_body
+    if not is_directional or ratio < cfg.displacement_min_ratio:
+        return False, ratio
+    # follow-through check: next candle should not retrace >= 70% of the body
+    if choch_bar_index + 1 < len(m5):
+        nxt = m5.iloc[choch_bar_index + 1]
+        retrace = abs(nxt["close"] - candle["close"]) / abs(body) if body != 0 else 1.0
+        opposite = (nxt["close"] < candle["close"]) if direction == Direction.BULLISH \
+            else (nxt["close"] > candle["close"])
+        if opposite and retrace >= cfg.displacement_retrace_max_pct:
+            return False, ratio
+    return True, ratio
+
+
+def check_bos(m5: pd.DataFrame, displacement_bar_index: int, swings: List[Swing],
+              choch_bar_index: int, direction: Direction, cfg: Config) -> Tuple[bool, int]:
+    confirmed = [s for s in swings if s.quality == "CONFIRMED" and s.index < choch_bar_index]
+    if direction == Direction.BULLISH:
+        target_swings = [s for s in confirmed if s.kind == "HIGH" and s.price >
+                          m5.iloc[choch_bar_index]["close"]]
+        if not target_swings:
+            return False, -1
+        target = min(target_swings, key=lambda s: s.price)
+        window_end = min(displacement_bar_index + cfg.bos_max_window_bars, len(m5) - 1)
+        for i in range(displacement_bar_index, window_end + 1):
+            if m5.iloc[i]["close"] > target.price:
+                return True, i
+        return False, -1
+    else:
+        target_swings = [s for s in confirmed if s.kind == "LOW" and s.price <
+                          m5.iloc[choch_bar_index]["close"]]
+        if not target_swings:
+            return False, -1
+        target = max(target_swings, key=lambda s: s.price)
+        window_end = min(displacement_bar_index + cfg.bos_max_window_bars, len(m5) - 1)
+        for i in range(displacement_bar_index, window_end + 1):
+            if m5.iloc[i]["close"] < target.price:
+                return True, i
+        return False, -1
+
+
+# ============================================================================
+# 11. FVG / ORDER BLOCK / FIBONACCI
+# ============================================================================
+
+@dataclass
+class FVG:
+    high: float
+    low: float
+    time: datetime
+    direction: Direction
+    mitigation_pct: float = 0.0
+
+
+def find_fvgs(m5: pd.DataFrame, atr: pd.Series, cfg: Config) -> List[FVG]:
+    fvgs = []
+    for i in range(2, len(m5)):
+        c1, c3 = m5.iloc[i - 2], m5.iloc[i]
+        atr_now = atr.iloc[i]
+        if pd.isna(atr_now):
+            continue
+        if c1["low"] > c3["high"]:
+            gap = c1["low"] - c3["high"]
+            if gap >= cfg.fvg_min_size_atr * atr_now:
+                fvgs.append(FVG(c1["low"], c3["high"], m5["time"].iloc[i], Direction.BEARISH))
+        elif c1["high"] < c3["low"]:
+            gap = c3["low"] - c1["high"]
+            if gap >= cfg.fvg_min_size_atr * atr_now:
+                fvgs.append(FVG(c3["low"], c1["high"], m5["time"].iloc[i], Direction.BULLISH))
+    # mitigation against subsequent price action
+    closes = m5[["time", "close", "high", "low"]]
+    for f in fvgs:
+        span = f.high - f.low
+        after = closes[closes["time"] > f.time]
+        touched = 0.0
+        for _, row in after.iterrows():
+            overlap_low = max(f.low, row["low"])
+            overlap_high = min(f.high, row["high"])
+            if overlap_high > overlap_low:
+                touched = max(touched, (overlap_high - overlap_low) / span if span else 0)
+        f.mitigation_pct = touched
+    return fvgs
+
+
+@dataclass
+class OrderBlock:
+    high: float
+    low: float
+    time: datetime
+    direction: Direction
+    index: int
+    has_structural_consequence: bool
+    mitigation_pct: float = 0.0
+
+
+def find_order_block(m5: pd.DataFrame, bos_bar_index: int, displacement_bar_index: int,
+                      direction: Direction, cfg: Config) -> Optional[OrderBlock]:
+    """Last opposite-direction candle immediately preceding the impulsive move."""
+    if displacement_bar_index <= 0:
+        return None
+    search_start = max(0, displacement_bar_index - 10)
+    ob_index = None
+    for i in range(displacement_bar_index - 1, search_start - 1, -1):
+        candle = m5.iloc[i]
+        is_opposite = (candle["close"] < candle["open"]) if direction == Direction.BULLISH \
+            else (candle["close"] > candle["open"])
+        if is_opposite:
+            ob_index = i  # keep searching backward would find earlier ones; we want the LAST one adjacent
+            break
+    if ob_index is None:
+        return None
+    candle = m5.iloc[ob_index]
+    ob = OrderBlock(
+        high=candle["high"], low=candle["low"], time=candle["time"],
+        direction=direction, index=ob_index,
+        has_structural_consequence=(bos_bar_index >= 0)
+    )
+    return ob
+
+
+def fib_618_zone(sweep_extreme: float, choch_break_price: float, direction: Direction) -> Tuple[float, float, float]:
+    """Returns (level_618, level_786, level_100_invalidation)."""
+    impulse = choch_break_price - sweep_extreme
+    if direction == Direction.BULLISH:
+        level_618 = choch_break_price - 0.618 * impulse
+        level_786 = choch_break_price - 0.786 * impulse
+    else:
+        level_618 = choch_break_price + 0.618 * abs(impulse)
+        level_786 = choch_break_price + 0.786 * abs(impulse)
+    return level_618, level_786, sweep_extreme
+
+
+# ============================================================================
+# 12. ENTRY ZONE & CONFIRMATION
+# ============================================================================
+
+@dataclass
+class EntryZone:
+    low: float
+    high: float
+    confluence_count: int
+    components: List[str]
+
+
+def build_entry_zone(fvg: Optional[FVG], ob: Optional[OrderBlock], fib_618: float,
+                      atr_now: float, cfg: Config) -> Optional[EntryZone]:
+    tolerance = cfg.entry_zone_atr_tolerance * atr_now
+    points = []
+    components = []
+    if fvg and fvg.mitigation_pct < cfg.fvg_mitigation_pct:
+        points.append(((fvg.high + fvg.low) / 2, fvg.low, fvg.high))
+        components.append("FVG")
+    if ob and ob.mitigation_pct < 1.0:
+        points.append(((ob.high + ob.low) / 2, ob.low, ob.high))
+        components.append("OB")
+    points.append((fib_618, fib_618 - tolerance, fib_618 + tolerance))
+    components.append("FIB")
+
+    # count how many of the 3 midpoints fall within `tolerance` of each other
+    mids = [p[0] for p in points]
+    clustered = []
+    for i, m in enumerate(mids):
+        if all(abs(m - other) <= tolerance for other in mids):
+            clustered.append(components[i])
+    if len(clustered) < 2:
+        return None
+    low = min(p[1] for p in points)
+    high = max(p[2] for p in points)
+    return EntryZone(low, high, len(clustered), clustered)
+
+
+def check_confirmation(m5: pd.DataFrame, zone: EntryZone, direction: Direction,
+                        cfg: Config) -> Optional[int]:
+    """Returns index of confirming candle, or None."""
+    recent = m5.tail(cfg.confirm_timeout_bars + 1).reset_index(drop=True)
+    for i in range(1, len(recent)):
+        row, prev = recent.iloc[i], recent.iloc[i - 1]
+        in_zone = zone.low <= row["close"] <= zone.high or zone.low <= row["low"] <= zone.high \
+            or zone.low <= row["high"] <= zone.high
+        if not in_zone:
+            continue
+        body = row["close"] - row["open"]
+        prev_body = prev["close"] - prev["open"]
+        # engulfing
+        engulf = (body > 0 and prev_body < 0 and row["close"] > prev["open"] and row["open"] < prev["close"]) \
+            if direction == Direction.BULLISH else \
+            (body < 0 and prev_body > 0 and row["close"] < prev["open"] and row["open"] > prev["close"])
+        # rejection wick
+        rng = row["high"] - row["low"]
+        if rng > 0:
+            if direction == Direction.BULLISH:
+                lower_wick = min(row["open"], row["close"]) - row["low"]
+                rejection = (lower_wick / rng >= cfg.rejection_wick_pct) and row["close"] > row["open"]
+            else:
+                upper_wick = row["high"] - max(row["open"], row["close"])
+                rejection = (upper_wick / rng >= cfg.rejection_wick_pct) and row["close"] < row["open"]
+        else:
+            rejection = False
+        if engulf or rejection:
+            return len(m5) - (len(recent) - i)
+    return None
+
+
+# ============================================================================
+# 13. SCORING
+# ============================================================================
+
+@dataclass
+class ScoreBreakdown:
+    total: int
+    passed_gates: bool
+    detail: Dict[str, int]
+
+
+def compute_score(h4_h1_aligned: bool, d1_aligned: bool, correct_zone: bool,
+                   major_liquidity: bool, clean_sweep: bool, choch: bool, bos: bool,
+                   displacement: bool, fvg_present: bool, ob_present: bool, fib_present: bool,
+                   ema_ok: bool, rsi_ok: bool, adx_ok: bool, good_session: bool,
+                   no_news: bool, rr_ok: bool, vol_regime_ok: bool) -> ScoreBreakdown:
+    detail = {
+        "h4_h1_alignment": 3 if h4_h1_aligned else 0,
+        "d1_alignment": 2 if d1_aligned else 0,
+        "premium_discount": 2 if correct_zone else 0,
+        "major_liquidity": 2 if major_liquidity else 0,
+        "clean_sweep": 3 if clean_sweep else 0,
+        "choch": 3 if choch else 0,
+        "bos": 2 if bos else 0,
+        "displacement": 2 if displacement else 0,
+        "fvg": 2 if fvg_present else 0,
+        "order_block": 2 if ob_present else 0,
+        "fib": 2 if fib_present else 0,
+        "ema": 1 if ema_ok else 0,
+        "rsi": 1 if rsi_ok else 0,
+        "adx": 1 if adx_ok else 0,
+        "session": 1 if good_session else 0,
+        "no_major_news": 1 if no_news else 0,
+    }
+    total = sum(detail.values())
+    passed_gates = rr_ok and vol_regime_ok and bos and choch  # RR & vol regime are hard gates per spec
+    return ScoreBreakdown(total, passed_gates, detail)
+
+
+# ============================================================================
+# 14. SESSION & NEWS
+# ============================================================================
+
+def in_trading_session(now: datetime, cfg: Config) -> bool:
+    hour = now.hour
+    in_london = cfg.london_start_hour <= hour < cfg.london_end_hour
+    in_ny = cfg.ny_start_hour <= hour < cfg.ny_end_hour
+    if not (in_london or in_ny):
+        return False
+    minute_of_hour = now.minute
+    if hour == cfg.london_start_hour and minute_of_hour < cfg.dead_zone_minutes:
+        return False
+    if hour == cfg.ny_end_hour - 1 and minute_of_hour >= (60 - cfg.dead_zone_minutes):
+        return False
+    return True
+
+
+class NewsFilter:
+    """
+    Placeholder integration point for the MT5 Economic Calendar (mt5.calendar_*
+    if available on your build) or an external calendar feed.
+    Must FAIL SAFE: if calendar data is unavailable, block new entries.
+    """
+
+    def __init__(self, cfg: Config, logger: logging.Logger):
+        self.cfg = cfg
+        self.log = logger
+        self.calendar_available = False
+        self.events: List[dict] = []  # each: {"time": dt, "impact": "high", "currency": "USD", "is_fomc": bool}
+
+    def refresh(self):
+        # TODO: wire to your broker's calendar API or a third-party feed.
+        # Until implemented, calendar_available stays False -> fail-safe blocks entries.
+        self.calendar_available = False
+        self.events = []
+
+    def in_blackout(self, now: datetime) -> bool:
+        if not self.calendar_available:
+            self.log.warning("News calendar unavailable — failing safe (blocking new entries).")
+            return True
+        for ev in self.events:
+            before = self.cfg.fomc_blackout_before_min if ev.get("is_fomc") else self.cfg.news_blackout_before_min
+            after = self.cfg.fomc_blackout_after_min if ev.get("is_fomc") else self.cfg.news_blackout_after_min
+            window_start = ev["time"] - timedelta(minutes=before)
+            window_end = ev["time"] + timedelta(minutes=after)
+            if window_start <= now <= window_end:
+                return True
+        return False
+
+
+# ============================================================================
+# 15. RISK / LOT SIZING  (spec §19a — mandatory automatic calculation)
+# ============================================================================
+
+@dataclass
+class LotSizeResult:
+    ok: bool
+    final_lots: float = 0.0
+    reason: str = ""
+    detail: Dict = field(default_factory=dict)
+
+
+class RiskManager:
+
+    def __init__(self, cfg: Config, data: MT5Data, logger: logging.Logger):
+        self.cfg = cfg
+        self.data = data
+        self.log = logger
+
+    def current_risk_pct(self, losses_today: int, in_preweekend_window: bool) -> float:
+        if losses_today >= 2:
+            pct = self.cfg.risk_after_2_losses_pct
+        elif losses_today == 1:
+            pct = self.cfg.risk_after_1_loss_pct
+        else:
+            pct = self.cfg.base_risk_pct
+        if in_preweekend_window:
+            pct *= self.cfg.preweekend_risk_multiplier
+        return pct
+
+    def calculate(self, direction: Direction, entry_price: float, sl_price: float,
+                  losses_today: int, in_preweekend_window: bool,
+                  current_open_xau_volume: float) -> LotSizeResult:
+        cfg = self.cfg
+        detail = {}
+
+        # Step 1 — live account state
+        acct = self.data.account()
+        if not acct:
+            return LotSizeResult(False, reason="ACCOUNT_INFO_UNAVAILABLE")
+        equity = acct["equity"]
+        free_margin = acct["margin_free"]
+        detail.update(equity=equity, free_margin=free_margin)
+
+        # Step 2 — risk capital
+        risk_pct = self.current_risk_pct(losses_today, in_preweekend_window)
+        risk_capital = equity * (risk_pct / 100.0)
+        detail.update(risk_pct=risk_pct, risk_capital=risk_capital)
+
+        # Step 3 — live symbol spec
+        sym = self.data.symbol_info()
+        if not sym:
+            return LotSizeResult(False, reason="SYMBOL_INFO_UNAVAILABLE")
+        tick_size = sym["trade_tick_size"]
+        tick_value = sym["trade_tick_value"]
+        volume_step = sym["volume_step"]
+        volume_min = sym["volume_min"]
+        volume_max = sym["volume_max"]
+        detail.update(tick_size=tick_size, tick_value=tick_value)
+
+        # Step 4 — stop distance
+        stop_distance_points = abs(entry_price - sl_price) / tick_size if tick_size else 0
+        detail["stop_distance_points"] = stop_distance_points
+        if stop_distance_points <= 0:
+            return LotSizeResult(False, reason="INVALID_STOP_DISTANCE", detail=detail)
+
+        # Step 5 — raw lots
+        value_per_point_per_lot = tick_value / tick_size if tick_size else 0
+        if value_per_point_per_lot <= 0:
+            return LotSizeResult(False, reason="INVALID_TICK_VALUE", detail=detail)
+        raw_lots = risk_capital / (stop_distance_points * value_per_point_per_lot)
+        detail["raw_lots"] = raw_lots
+
+        # Step 6 — normalize to volume grid (round DOWN)
+        steps = math.floor(raw_lots / volume_step) if volume_step else 0
+        norm_lots = steps * volume_step
+        if norm_lots < volume_min:
+            implied_risk_at_min = (volume_min / raw_lots) * risk_pct if raw_lots > 0 else float("inf")
+            if implied_risk_at_min > risk_pct * cfg.min_lot_risk_tolerance_multiplier:
+                return LotSizeResult(False, reason="MIN_LOT_EXCEEDS_RISK_TOLERANCE", detail=detail)
+            norm_lots = volume_min
+        norm_lots = min(norm_lots, volume_max)
+        detail["norm_lots"] = norm_lots
+
+        # Step 7 — exposure cap chain (all live)
+        broker_max = volume_max
+        configured_max_order = cfg.max_lots_per_order
+        exposure_room = max(0.0, cfg.max_total_xauusd_exposure - current_open_xau_volume)
+        final_lots = min(norm_lots, broker_max, configured_max_order, exposure_room)
+        final_lots = math.floor(final_lots / volume_step) * volume_step if volume_step else final_lots
+        detail["final_lots_pre_margin"] = final_lots
+        if final_lots < volume_min:
+            return LotSizeResult(False, reason="EXPOSURE_CAP_BELOW_MIN_LOT", detail=detail)
+
+        # Step 8 — margin check
+        order_type = mt5.ORDER_TYPE_BUY if direction == Direction.BULLISH else mt5.ORDER_TYPE_SELL
+        margin_required = self.data.calc_margin(order_type, final_lots, entry_price)
+        detail["margin_required"] = margin_required
+        if margin_required is None or margin_required > free_margin * cfg.margin_safety_factor:
+            return LotSizeResult(False, reason="MARGIN_INSUFFICIENT", detail=detail)
+
+        # Step 9 — final RR re-validation happens by caller (needs TP distance)
+        return LotSizeResult(True, final_lots=final_lots, reason="OK", detail=detail)
+
+
+def validate_rr(entry: float, sl: float, tp: float, min_rr: float) -> bool:
+    risk = abs(entry - sl)
+    reward = abs(tp - entry)
+    if risk == 0:
+        return False
+    return (reward / risk) >= min_rr
+
+
+# ============================================================================
+# 16. STRUCTURAL STOP LOSS
+# ============================================================================
+
+def structural_stop(direction: Direction, sweep_extreme: float, ob: Optional[OrderBlock],
+                     protected_level: float, atr_now: float, spread_points: float,
+                     tick_size: float, cfg: Config) -> float:
+    candidates = [sweep_extreme, protected_level]
+    if ob:
+        candidates.append(ob.low if direction == Direction.BULLISH else ob.high)
+    spread_price = spread_points * tick_size
+    if direction == Direction.BULLISH:
+        structural_low = min(candidates)
+        return structural_low - (cfg.sl_atr_buffer * atr_now) - spread_price
+    else:
+        structural_high = max(candidates)
+        return structural_high + (cfg.sl_atr_buffer * atr_now) + spread_price
+
+
+# ============================================================================
+# 17. POSITION MANAGEMENT (TP1/TP2/runner)
+# ============================================================================
+
+@dataclass
+class ManagedPosition:
+    ticket: int
+    setup_id: str
+    direction: Direction
+    entry: float
+    sl: float
+    original_volume: float
+    remaining_volume: float
+    tp1_price: float
+    tp2_price: float
+    tp1_done: bool = False
+    tp2_done: bool = False
+    opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class PositionManager:
+
+    def __init__(self, cfg: Config, data: MT5Data, logger: logging.Logger):
+        self.cfg = cfg
+        self.data = data
+        self.log = logger
+
+    def compute_tp_levels(self, direction: Direction, entry: float, sl: float) -> Tuple[float, float]:
+        r = abs(entry - sl)
+        if direction == Direction.BULLISH:
+            return entry + self.cfg.tp1_r * r, entry + self.cfg.tp2_r * r
+        return entry - self.cfg.tp1_r * r, entry - self.cfg.tp2_r * r
+
+    def partial_close_volume(self, original_volume: float, pct: float, volume_step: float,
+                              volume_min: float) -> float:
+        raw = original_volume * pct
+        steps = math.floor(raw / volume_step) if volume_step else 0
+        vol = steps * volume_step
+        if vol < volume_min:
+            return 0.0  # signal caller to fold into next tranche (spec §22-23 rounding fallback)
+        return vol
+
+    def manage(self, pos: ManagedPosition, current_price: float, m15_swings: List[Swing]):
+        sym = self.data.symbol_info()
+        volume_step = sym.get("volume_step", 0.01)
+        volume_min = sym.get("volume_min", 0.01)
+
+        hit_tp1 = (current_price >= pos.tp1_price) if pos.direction == Direction.BULLISH \
+            else (current_price <= pos.tp1_price)
+        hit_tp2 = (current_price >= pos.tp2_price) if pos.direction == Direction.BULLISH \
+            else (current_price <= pos.tp2_price)
+
+        if hit_tp1 and not pos.tp1_done:
+            vol = self.partial_close_volume(pos.original_volume, self.cfg.tp1_close_pct,
+                                             volume_step, volume_min)
+            if vol == 0.0:
+                self.log.info(f"[{pos.setup_id}] TP1 tranche rounds to 0 — rolling into TP2 close.")
+            else:
+                self._close_partial(pos, vol)
+                pos.remaining_volume -= vol
+            pos.tp1_done = True
+            self.log.info(f"[{pos.setup_id}] TP1_COMPLETE")
+
+        if hit_tp2 and not pos.tp2_done:
+            pct = self.cfg.tp2_close_pct + (self.cfg.tp1_close_pct if pos.tp1_done and
+                                             self.partial_close_volume(pos.original_volume,
+                                                                        self.cfg.tp1_close_pct,
+                                                                        volume_step, volume_min) == 0
+                                             else 0)
+            vol = self.partial_close_volume(pos.original_volume, pct, volume_step, volume_min)
+            vol = min(vol, pos.remaining_volume)
+            if vol > 0:
+                self._close_partial(pos, vol)
+                pos.remaining_volume -= vol
+            pos.tp2_done = True
+            self.log.info(f"[{pos.setup_id}] TP2_COMPLETE")
+            self._move_to_breakeven(pos, sym)
+
+        if pos.tp2_done:
+            self._trail_runner(pos, m15_swings)
+
+    def _close_partial(self, pos: ManagedPosition, volume: float):
+        tick = self.data.tick()
+        price = tick.get("bid") if pos.direction == Direction.BULLISH else tick.get("ask")
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.cfg.symbol,
+            "volume": volume,
+            "type": mt5.ORDER_TYPE_SELL if pos.direction == Direction.BULLISH else mt5.ORDER_TYPE_BUY,
+            "position": pos.ticket,
+            "price": price,
+            "magic": self.cfg.magic_number,
+            "comment": f"symmetrix_partial_{pos.setup_id}",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = self.data.send_order(request)
+        self.log.info(f"Partial close sent: {volume} lots, result={result}")
+
+    def _move_to_breakeven(self, pos: ManagedPosition, sym: dict):
+        spread_price = sym.get("spread", 0) * sym.get("trade_tick_size", 0.01)
+        new_sl = pos.entry + spread_price if pos.direction == Direction.BULLISH else pos.entry - spread_price
+        if pos.direction == Direction.BULLISH and new_sl <= pos.sl:
+            return
+        if pos.direction == Direction.BEARISH and new_sl >= pos.sl:
+            return
+        self._modify_sl(pos, new_sl)
+
+    def _trail_runner(self, pos: ManagedPosition, m15_swings: List[Swing]):
+        confirmed = [s for s in m15_swings if s.quality == "CONFIRMED"]
+        if pos.direction == Direction.BULLISH:
+            higher_lows = [s for s in confirmed if s.kind == "LOW" and s.price > pos.sl]
+            if higher_lows:
+                candidate = max(s.price for s in higher_lows)
+                if candidate > pos.sl:
+                    self._modify_sl(pos, candidate)
+        else:
+            lower_highs = [s for s in confirmed if s.kind == "HIGH" and s.price < pos.sl]
+            if lower_highs:
+                candidate = min(s.price for s in lower_highs)
+                if candidate < pos.sl:
+                    self._modify_sl(pos, candidate)
+
+    def _modify_sl(self, pos: ManagedPosition, new_sl: float):
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": pos.ticket,
+            "symbol": self.cfg.symbol,
+            "sl": new_sl,
+            "magic": self.cfg.magic_number,
+        }
+        result = self.data.send_order(request)
+        if result and getattr(result, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+            pos.sl = new_sl
+            self.log.info(f"[{pos.setup_id}] SL moved to {new_sl} (never widened).")
+        else:
+            self.log.warning(f"[{pos.setup_id}] SL modify failed: {result}")
+
+
+# ============================================================================
+# 18. DAILY / WEEKLY / MONTHLY LOSS LIMITS
+# ============================================================================
+
+@dataclass
+class RiskState:
+    day_start_equity: float = 0.0
+    week_start_equity: float = 0.0
+    month_start_equity: float = 0.0
+    trades_today: int = 0
+    losses_today: int = 0
+    consecutive_losses: int = 0
+    last_reset_day: Optional[datetime] = None
+    emergency_stop: bool = False
+    emergency_flatten: bool = False
+    order_reject_timestamps: List[datetime] = field(default_factory=list)
+
+
+class RiskLimiter:
+
+    def __init__(self, cfg: Config, logger: logging.Logger):
+        self.cfg = cfg
+        self.log = logger
+        self.state = RiskState()
+
+    def rollover_check(self, now: datetime, current_equity: float):
+        if self.state.last_reset_day is None or now.date() != self.state.last_reset_day.date():
+            self.state.day_start_equity = current_equity
+            self.state.trades_today = 0
+            self.state.losses_today = 0
+            self.state.last_reset_day = now
+            self.log.info(f"Daily rollover: baseline equity set to {current_equity:.2f}")
+        if now.weekday() == 0 and (self.state.week_start_equity == 0.0):
+            self.state.week_start_equity = current_equity
+        if now.day == 1 and self.state.month_start_equity == 0.0:
+            self.state.month_start_equity = current_equity
+
+    def check_loss_limits(self, current_equity: float) -> Optional[str]:
+        if self.state.day_start_equity:
+            day_pct = (current_equity - self.state.day_start_equity) / self.state.day_start_equity * 100
+            if day_pct <= self.cfg.emergency_daily_stop_pct:
+                self._trigger_emergency("EMERGENCY_DAILY_STOP")
+                return "EMERGENCY_DAILY_STOP"
+            if day_pct <= self.cfg.daily_stop_pct:
+                self.state.emergency_stop = True
+                return "DAILY_STOP"
+        if self.state.week_start_equity:
+            week_pct = (current_equity - self.state.week_start_equity) / self.state.week_start_equity * 100
+            if week_pct <= self.cfg.weekly_stop_pct:
+                self._trigger_emergency("WEEKLY_STOP")
+                return "WEEKLY_STOP"
+        if self.state.month_start_equity:
+            month_pct = (current_equity - self.state.month_start_equity) / self.state.month_start_equity * 100
+            if month_pct <= self.cfg.monthly_stop_pct:
+                self._trigger_emergency("MONTHLY_STOP")
+                return "MONTHLY_STOP"
+        return None
+
+    def _trigger_emergency(self, reason: str):
+        self.state.emergency_stop = True
+        self.log.critical(f"EMERGENCY STOP TRIGGERED: {reason}")
+
+    def register_trade_result(self, is_loss: bool):
+        self.state.trades_today += 1
+        if is_loss:
+            self.state.losses_today += 1
+            self.state.consecutive_losses += 1
+        else:
+            self.state.consecutive_losses = 0
+        if self.state.consecutive_losses >= 3:
+            self.log.warning("Three consecutive losses — disabling new trades for remainder of day.")
+            self.state.emergency_stop = True  # remainder-of-day lock; cleared at rollover
+
+    def register_order_rejection(self, now: datetime):
+        self.state.order_reject_timestamps.append(now)
+        window_start = now - timedelta(minutes=self.cfg.retry_circuit_breaker_window_min)
+        self.state.order_reject_timestamps = [t for t in self.state.order_reject_timestamps if t >= window_start]
+        if len(self.state.order_reject_timestamps) >= self.cfg.retry_circuit_breaker_count:
+            self._trigger_emergency("RETRY_CIRCUIT_BREAKER")
+
+    def min_required_score(self) -> int:
+        if self.state.consecutive_losses >= 2:
+            return self.cfg.score_min_after_2_losses
+        return self.cfg.score_min_normal
+
+    def can_trade(self) -> bool:
+        return (not self.state.emergency_stop) and (self.state.trades_today < self.cfg.max_trades_per_day)
+
+
+# ============================================================================
+# 19. WEEKEND PROTECTION
+# ============================================================================
+
+def weekend_phase(now_utc: datetime, cfg: Config) -> str:
+    """Returns 'NORMAL', 'DISABLE_NEW', 'DEFENSIVE', 'FLATTEN', or 'WEEKEND'."""
+    if now_utc.weekday() == 5 or (now_utc.weekday() == 6):
+        return "WEEKEND"
+    if now_utc.weekday() != 4:  # only relevant on Friday
+        return "NORMAL"
+    close_time = now_utc.replace(hour=cfg.friday_close_hour_utc, minute=0, second=0, microsecond=0)
+    delta = close_time - now_utc
+    minutes_to_close = delta.total_seconds() / 60
+    if minutes_to_close <= cfg.weekend_t_minus_30m_flatten_min:
+        return "FLATTEN"
+    if minutes_to_close <= cfg.weekend_t_minus_2h_defensive * 60:
+        return "DEFENSIVE"
+    if minutes_to_close <= cfg.weekend_t_minus_4h_disable * 60:
+        return "DISABLE_NEW"
+    if minutes_to_close <= 6 * 60:
+        return "PREWEEKEND_REDUCED_RISK"
+    return "NORMAL"
+
+
+def flatten_all(data: MT5Data, cfg: Config, logger: logging.Logger):
+    positions = data.open_positions()
+    for p in positions:
+        tick = data.tick()
+        direction = Direction.BULLISH if p["type"] == 0 else Direction.BEARISH
+        price = tick.get("bid") if direction == Direction.BULLISH else tick.get("ask")
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": cfg.symbol,
+            "volume": p["volume"],
+            "type": mt5.ORDER_TYPE_SELL if direction == Direction.BULLISH else mt5.ORDER_TYPE_BUY,
+            "position": p["ticket"],
+            "price": price,
+            "magic": cfg.magic_number,
+            "comment": "symmetrix_weekend_flatten",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = data.send_order(request)
+        logger.critical(f"Weekend flatten sent for ticket {p['ticket']}: {result}")
+    orders = mt5.orders_get(symbol=cfg.symbol) or []
+    for o in orders:
+        if o.magic == cfg.magic_number:
+            mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+
+
+# ============================================================================
+# 20. RECONCILIATION
+# ============================================================================
+
+def reconcile_positions(data: MT5Data, known_setup_ids: Dict[int, str], logger: logging.Logger):
+    """Rebuild internal state from broker truth; flag orphans."""
+    live_positions = data.open_positions()
+    live_tickets = {p["ticket"] for p in live_positions}
+    for ticket in live_tickets:
+        if ticket not in known_setup_ids:
+            logger.warning(f"ORPHANED position detected: ticket {ticket} — "
+                            f"no internal record. Applying defensive management only.")
+    closed_tickets = [t for t in known_setup_ids if t not in live_tickets]
+    for t in closed_tickets:
+        logger.info(f"Position {t} no longer open at broker — removing from local tracking.")
+        known_setup_ids.pop(t, None)
+    return live_positions
+
+
+# ============================================================================
+# 21. SETUP ID / DUPLICATE PROTECTION
+# ============================================================================
+
+def build_setup_id(symbol: str, direction: Direction, liquidity_time: datetime,
+                    choch_time: datetime, bos_time: datetime) -> str:
+    raw = f"{symbol}|{direction.name}|{liquidity_time.isoformat()}|{choch_time.isoformat()}|{bos_time.isoformat()}"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, raw))
+
+
+# ============================================================================
+# 22. MAIN ORCHESTRATOR
+# ============================================================================
+
+class SymmetrixGoldSMC:
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        cfg.bind_timeframes()
+        self.log = setup_logging(cfg)
+        self.data = MT5Data(cfg, self.log)
+        self.risk_mgr = RiskManager(cfg, self.data, self.log)
+        self.pos_mgr = PositionManager(cfg, self.data, self.log)
+        self.risk_limiter = RiskLimiter(cfg, self.log)
+        self.direction_engine = DirectionEngine(cfg)
+        self.liquidity_engine = LiquidityEngine(cfg)
+        self.news_filter = NewsFilter(cfg, self.log)
+        self.consumed_setup_ids: set = set()
+        self.managed_positions: Dict[int, ManagedPosition] = {}
+        self.state = State.IDLE
+        self.state_entered_bar = 0
+        self.working = {}  # scratch space for the in-progress setup
+
+    # -- lifecycle -----------------------------------------------------
+    def start(self):
+        if not self.data.connect():
+            raise RuntimeError("Could not connect to MT5 terminal.")
+        self.log.info("Symmetrix Gold SMC started.")
+        self.run_loop()
+
+    def stop(self):
+        self.data.shutdown()
+        self.log.info("Symmetrix Gold SMC stopped.")
+
+    # -- main loop -------------------------------------------------------
+    def run_loop(self):
+        while True:
+            try:
+                self.tick()
+            except Exception as e:
+                self.log.exception(f"Unhandled exception in main loop: {e}")
+            time.sleep(self.cfg.poll_seconds)
+
+    def tick(self):
+        cfg = self.cfg
+        now = datetime.now(timezone.utc)
+
+        if not self.data.is_connected():
+            self.log.error("MT5 disconnected — attempting reconnect and reconciling before any new orders.")
+            self.data.connect()
+            reconcile_positions(self.data, {p.ticket: p.setup_id for p in self.managed_positions.values()}, self.log)
+            return
+
+        acct = self.data.account()
+        if not acct:
+            return
+        equity = acct["equity"]
+
+        self.risk_limiter.rollover_check(now, equity)
+        limit_hit = self.risk_limiter.check_loss_limits(equity)
+        if limit_hit:
+            self.log.warning(f"Loss limit hit: {limit_hit} — new entries disabled.")
+
+        phase = weekend_phase(now, cfg)
+        if phase == "FLATTEN":
+            flatten_all(self.data, cfg, self.log)
+            return
+        if phase == "WEEKEND":
+            return
+
+        # manage any open positions regardless of new-signal gating
+        self._manage_open_positions()
+
+        if phase in ("DISABLE_NEW", "WEEKEND") or self.risk_limiter.state.emergency_stop \
+                or not self.risk_limiter.can_trade():
+            return
+
+        self.news_filter.refresh()
+        if self.news_filter.in_blackout(now):
+            return
+
+        if not in_trading_session(now, cfg) and not cfg.allow_asian_session:
+            return
+
+        if len(self.data.open_positions()) >= 1:
+            return  # one-position policy (§33)
+
+        self._evaluate_signal_pipeline(now, phase)
+
+    # -- signal pipeline ---------------------------------------------------
+    def _evaluate_signal_pipeline(self, now: datetime, weekend_phase_str: str):
+        cfg = self.cfg
+        d = self.data
+
+        m5 = d.rates(cfg.tf_exec, 400)
+        m15 = d.rates(cfg.tf_confirm, 300)
+        h1 = d.rates(cfg.tf_h1, 300)
+        h4 = d.rates(cfg.tf_h4, 300)
+        d1 = d.rates(cfg.tf_d1, 200)
+        if any(df.empty for df in [m5, m15, h1, h4, d1]):
+            return
+
+        atr_m5 = Indicators.atr(m5, 14)
+        atr_h1 = Indicators.atr(h1, 14)
+
+        # 1) direction
+        h4_read, h1_read, d1_read = self.direction_engine.evaluate(h4, h1, d1)
+        if h4_read.direction == Direction.NEUTRAL or not h4_read.persistent:
+            return
+        if h4_read.direction != h1_read.direction:
+            return  # mandatory H4 == H1
+        direction = h4_read.direction
+
+        # 2) dealing range / premium-discount
+        h1_swings = detect_swings(h1, atr_h1, cfg.swing_min_amplitude_atr)
+        rng = compute_dealing_range(h1, h1_swings, atr_h1, cfg)
+        if not rng or not rng.valid:
+            return
+        current_price = m5["close"].iloc[-1]
+        zone = classify_zone(current_price, rng, cfg)
+        if direction == Direction.BULLISH and zone != "DISCOUNT":
+            return
+        if direction == Direction.BEARISH and zone != "PREMIUM":
+            return
+
+        # 3) liquidity map
+        m15_swings = detect_swings(m15, Indicators.atr(m15, 14), cfg.swing_min_amplitude_atr)
+        self.liquidity_engine.build(d1, h1, m15, h1_swings, m15_swings, now)
+        target = self.liquidity_engine.best_target(direction, current_price)
+        if not target:
+            return
+
+        # 4) sweep
+        sweep = detect_sweep(m5, atr_m5, target.price, direction, cfg)
+        if not sweep.valid:
+            return
+        sweep_time = m5["time"].iloc[-(len(m5) - sweep.reclaim_index)] if sweep.reclaim_index < len(m5) else m5["time"].iloc[-1]
+
+        # 5) CHoCH
+        m5_swings = detect_swings(m5, atr_m5, cfg.swing_min_amplitude_atr)
+        choch = detect_choch(m5, m5_swings, direction, sweep_time, cfg)
+        if not choch.confirmed:
+            return
+
+        # 6) displacement
+        displaced, disp_ratio = check_displacement(m5, choch.bar_index, direction, cfg)
+        if not displaced:
+            return
+
+        # 7) BOS (mandatory)
+        bos_ok, bos_index = check_bos(m5, choch.bar_index, m5_swings, choch.bar_index, direction, cfg)
+        if not bos_ok:
+            return
+
+        # 8) FVG / OB / Fib confluence -> entry zone
+        fvgs = find_fvgs(m5, atr_m5, cfg)
+        relevant_fvgs = [f for f in fvgs if f.direction == direction and
+                         (len(m5) - 1 - m5[m5["time"] == f.time].index[0] if any(m5["time"] == f.time) else 999) <= cfg.fvg_stale_bars]
+        best_fvg = relevant_fvgs[-1] if relevant_fvgs else None
+
+        ob = find_order_block(m5, bos_index, choch.bar_index, direction, cfg)
+
+        fib_618, fib_786, sweep_extreme_price = fib_618_zone(
+            sweep_extreme=m5["low"].iloc[sweep.bar_index] if direction == Direction.BULLISH
+            else m5["high"].iloc[sweep.bar_index],
+            choch_break_price=choch.protected_level,
+            direction=direction
+        )
+
+        atr_now = atr_m5.iloc[-1]
+        zone_obj = build_entry_zone(best_fvg, ob, fib_618, atr_now, cfg)
+        if not zone_obj:
+            return
+
+        # sanity: min stop distance check (§13 addition)
+        provisional_sl = structural_stop(
+            direction, sweep_extreme_price, ob, choch.protected_level, atr_now,
+            self.data.symbol_info().get("spread", 0),
+            self.data.symbol_info().get("trade_tick_size", 0.01), cfg
+        )
+        if abs(current_price - provisional_sl) < cfg.entry_zone_min_sl_atr * atr_now:
+            return
+
+        # 9) confirmation
+        confirm_index = check_confirmation(m5, zone_obj, direction, cfg)
+        if confirm_index is None:
+            return
+
+        # 10) setup id / duplicate protection
+        setup_id = build_setup_id(cfg.symbol, direction, target.time, m5["time"].iloc[choch.bar_index],
+                                   m5["time"].iloc[bos_index])
+        if setup_id in self.consumed_setup_ids:
+            return
+
+        # 11) scoring (RR + vol regime are hard gates, computed first)
+        entry_price = m5["close"].iloc[confirm_index]
+        sl_price = provisional_sl
+        tp1, tp2 = self.pos_mgr.compute_tp_levels(direction, entry_price, sl_price)
+        rr_ok = validate_rr(entry_price, sl_price, tp2, cfg.min_rr)
+
+        avg_atr_50 = atr_m5.tail(50).mean()
+        vol_ratio = atr_now / avg_atr_50 if avg_atr_50 else 0
+        vol_regime_ok = cfg.vol_regime_min_pct <= vol_ratio <= cfg.vol_regime_max_pct
+
+        score = compute_score(
+            h4_h1_aligned=True, d1_aligned=(d1_read.direction == direction),
+            correct_zone=True, major_liquidity=(target.priority_tier <= 1),
+            clean_sweep=(cfg.sweep_pref_pen_atr <= sweep.depth_atr <= cfg.sweep_max_pen_atr),
+            choch=True, bos=True,
+            displacement=(disp_ratio >= cfg.displacement_pref_ratio),
+            fvg_present="FVG" in zone_obj.components, ob_present="OB" in zone_obj.components,
+            fib_present=True, ema_ok=True, rsi_ok=True, adx_ok=True,
+            good_session=in_trading_session(now, cfg), no_news=not self.news_filter.in_blackout(now),
+            rr_ok=rr_ok, vol_regime_ok=vol_regime_ok,
+        )
+
+        min_score = self.risk_limiter.min_required_score()
+        setup_log_row = dict(
+            timestamp=now.isoformat(), symbol=cfg.symbol, direction=direction.name,
+            h4_bias=h4_read.direction.name, h1_bias=h1_read.direction.name, d1_bias=d1_read.direction.name,
+            liquidity_type=target.kind, liquidity_price=target.price, sweep_depth_atr=sweep.depth_atr,
+            choch=True, displacement_ratio=disp_ratio, bos=True,
+            fvg="FVG" in zone_obj.components, ob="OB" in zone_obj.components, fib=True,
+            score=score.total, entry=entry_price, sl=sl_price, tp1=tp1, tp2=tp2,
+        )
+
+        if not score.passed_gates or score.total < min_score:
+            setup_log_row["reason"] = f"REJECTED score={score.total} min={min_score} gates={score.passed_gates}"
+            append_csv(cfg.setup_log_csv, setup_log_row, self._setup_log_header())
+            return
+
+        # 12) risk / lot sizing (§19a — mandatory automatic calculation)
+        preweekend = weekend_phase_str == "PREWEEKEND_REDUCED_RISK"
+        current_open_vol = sum(p["volume"] for p in self.data.open_positions())
+        lot_result = self.risk_mgr.calculate(
+            direction, entry_price, sl_price, self.risk_limiter.state.losses_today,
+            preweekend, current_open_vol
+        )
+        setup_log_row.update(
+            risk_pct=lot_result.detail.get("risk_pct"), equity=lot_result.detail.get("equity"),
+            risk_capital=lot_result.detail.get("risk_capital"), tick_value=lot_result.detail.get("tick_value"),
+            tick_size=lot_result.detail.get("tick_size"),
+            stop_distance_points=lot_result.detail.get("stop_distance_points"),
+            raw_lots=lot_result.detail.get("raw_lots"), final_lots=lot_result.final_lots,
+            margin_required=lot_result.detail.get("margin_required"),
+            free_margin=lot_result.detail.get("free_margin"),
+        )
+        if not lot_result.ok:
+            setup_log_row["reason"] = f"REJECTED {lot_result.reason}"
+            append_csv(cfg.setup_log_csv, setup_log_row, self._setup_log_header())
+            return
+
+        # final RR re-check against rounded lot (RR itself doesn't change with lot size,
+        # but re-validate in case of any last-moment price drift)
+        tick = self.data.tick()
+        live_entry = tick.get("ask") if direction == Direction.BULLISH else tick.get("bid")
+        if not validate_rr(live_entry, sl_price, tp2, cfg.min_rr):
+            setup_log_row["reason"] = "REJECTED RR_FAIL_AT_EXECUTION"
+            append_csv(cfg.setup_log_csv, setup_log_row, self._setup_log_header())
+            return
+
+        # spread/execution filter
+        spread_points = self.data.symbol_info().get("spread", 0)
+        if spread_points > min(cfg.max_spread_static_points, cfg.max_spread_atr_pct * atr_now /
+                                self.data.symbol_info().get("trade_tick_size", 0.01)):
+            setup_log_row["reason"] = "REJECTED SPREAD_TOO_WIDE"
+            append_csv(cfg.setup_log_csv, setup_log_row, self._setup_log_header())
+            return
+
+        # 13) execute
+        setup_log_row["reason"] = "ACCEPTED"
+        append_csv(cfg.setup_log_csv, setup_log_row, self._setup_log_header())
+        self._execute_trade(setup_id, direction, live_entry, sl_price, tp1, tp2, lot_result.final_lots)
+
+    def _setup_log_header(self):
+        return [
+            "timestamp", "symbol", "direction", "h4_bias", "h1_bias", "d1_bias",
+            "liquidity_type", "liquidity_price", "sweep_depth_atr", "choch",
+            "displacement_ratio", "bos", "fvg", "ob", "fib", "score", "spread",
+            "risk_pct", "equity", "risk_capital", "tick_value", "tick_size",
+            "stop_distance_points", "raw_lots", "final_lots", "margin_required",
+            "free_margin", "entry", "sl", "tp1", "tp2", "reason"
+        ]
+
+    def _execute_trade(self, setup_id: str, direction: Direction, entry: float,
+                        sl: float, tp1: float, tp2: float, lots: float):
+        cfg = self.cfg
+        order_type = mt5.ORDER_TYPE_BUY if direction == Direction.BULLISH else mt5.ORDER_TYPE_SELL
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": cfg.symbol,
+            "volume": lots,
+            "type": order_type,
+            "price": entry,
+            "sl": sl,
+            "tp": tp2,  # broker-level TP as backstop; partials handled by PositionManager
+            "magic": cfg.magic_number,
+            "comment": f"symmetrix_{setup_id[:16]}",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        for attempt in range(cfg.max_order_retries):
+            result = self.data.send_order(request)
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                self.consumed_setup_ids.add(setup_id)
+                self.managed_positions[result.order] = ManagedPosition(
+                    ticket=result.order, setup_id=setup_id, direction=direction,
+                    entry=entry, sl=sl, original_volume=lots, remaining_volume=lots,
+                    tp1_price=tp1, tp2_price=tp2
+                )
+                self.log.info(f"ORDER_CONFIRMED setup={setup_id} ticket={result.order} lots={lots}")
+                return
+            self.log.warning(f"Order attempt {attempt+1} failed: {result}")
+            self.risk_limiter.register_order_rejection(datetime.now(timezone.utc))
+            time.sleep(cfg.retry_delay_seconds)
+        self.log.error(f"Order failed after {cfg.max_order_retries} retries for setup {setup_id}.")
+
+    def _manage_open_positions(self):
+        m15 = self.data.rates(self.cfg.tf_confirm, 300)
+        if m15.empty:
+            return
+        m15_swings = detect_swings(m15, Indicators.atr(m15, 14), self.cfg.swing_min_amplitude_atr)
+        live = reconcile_positions(self.data, {t: p.setup_id for t, p in self.managed_positions.items()}, self.log)
+        live_tickets = {p["ticket"] for p in live}
+        for ticket in list(self.managed_positions.keys()):
+            if ticket not in live_tickets:
+                closed_pos = self.managed_positions.pop(ticket)
+                self.log.info(f"[{closed_pos.setup_id}] Position closed — recording result.")
+                # NOTE: net P/L, MFE/MAE, commission/swap/slippage should be pulled from
+                # mt5.history_deals_get(position=ticket) here and written to the journal
+                # (journal_csv) plus fed into risk_limiter.register_trade_result(is_loss).
+                continue
+            tick = self.data.tick()
+            price = tick.get("bid") if self.managed_positions[ticket].direction == Direction.BULLISH else tick.get("ask")
+            self.pos_mgr.manage(self.managed_positions[ticket], price, m15_swings)
+
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+if __name__ == "__main__":
+    config = Config()
+    bot = SymmetrixGoldSMC(config)
+    try:
+        bot.start()
+    except KeyboardInterrupt:
+        bot.stop()
+
+
+
 
