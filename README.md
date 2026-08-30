@@ -2098,3 +2098,1692 @@ if __name__ == "__main__":
 
 
 
+
+
+SYMMETRIX GOLD SMC v3.0
+Production EA Coding & Parameter Specification
+High-Selectivity XAUUSD Automated Trading System — MT5 / MQL5
+This document is intended to serve as the coding specification for the Expert Advisor. It combines the strengthened SMC specification, the master multi-timeframe architecture, automatic position sizing, risk/exposure management, mandatory stop-loss protection, execution safeguards, recovery logic, and the higher-selectivity rules intended to test whether a sustainable 75%–80% win-rate region exists.
+The 75%–80% figure must remain a validation target, not a guaranteed performance claim. Production acceptance must come from historical, out-of-sample, walk-forward, stress, Monte Carlo, demo-forward, and controlled live testing. The strengthened specification itself requires at least 100 combined OOS/walk-forward trades before profitability statistics are treated as meaningful.
+________________________________________
+1. EA IDENTITY
+Parameter	Value
+EA Name	SYMMETRIX GOLD SMC
+Version	3.0 Production Candidate
+Platform	MetaTrader 5
+Language	MQL5
+Primary Symbol	XAUUSD
+Execution TF	M5
+Confirmation TF	M15
+Structural TF	H1
+Trend TF	H4
+Macro TF	D1
+Strategy	Multi-Timeframe SMC / Liquidity / Structure
+Execution	Fully Automatic
+Position Sizing	Fully Automatic
+Manual Lot Size	Prohibited
+Mandatory SL	TRUE
+Entry Without SL	Prohibited
+Martingale	Prohibited
+Grid	Prohibited
+Averaging Losing Trades	Prohibited
+Production Lock	TRUE
+Maximum Trades/Day	3
+Default Risk	0.25% current equity
+Target Research Win Rate	75%–80%
+Guaranteed Win Rate	NONE
+The existing master specification defines the EA as a fully automatic, risk-adjusted, production-locked XAUUSD system using M5, M15, H1, H4 and D1.
+________________________________________
+2. CORE OPERATING PRINCIPLE
+The EA operates as a deterministic state machine.
+It does not continuously ask:
+“Should I buy or sell?”
+Instead, it asks:
+Has every required condition in the setup sequence occurred in the correct order, within the permitted time window, using current synchronized market data?
+A trade can be submitted only after:
+Market Data → Direction → Liquidity → Sweep → CHoCH → Displacement → BOS → Entry Zone → Retracement → Confirmation → Quality Gate → Risk → Exposure → SL → Lot Size → Margin → Execution
+If one mandatory condition fails:
+NO TRADE
+________________________________________
+3. CONFIGURATION ARCHITECTURE
+There shall be two classes of parameters.
+A. PROTECTED STRATEGY PARAMETERS
+These are compiled into production logic and cannot be changed from normal EA inputs when:
+ProductionLock = true
+B. BROKER / OPERATIONAL PARAMETERS
+These may remain configurable because they vary by broker, server time, symbol suffix, execution policy or account.
+________________________________________
+4. PROTECTED CORE PARAMETERS
+Code Parameter	Type	Production Value	Editable
+ProductionLock	bool	true	No
+StrategySymbolBase	string	"XAUUSD"	No
+TF_EXECUTION	ENUM_TIMEFRAMES	PERIOD_M5	No
+TF_CONFIRMATION	ENUM_TIMEFRAMES	PERIOD_M15	No
+TF_STRUCTURE	ENUM_TIMEFRAMES	PERIOD_H1	No
+TF_TREND	ENUM_TIMEFRAMES	PERIOD_H4	No
+TF_MACRO	ENUM_TIMEFRAMES	PERIOD_D1	No
+MaxTradesPerDay	int	3	No
+AllowGrid	bool	false	No
+AllowMartingale	bool	false	No
+AllowAveragingLosers	bool	false	No
+AllowEntryWithoutSL	bool	false	No
+AllowSLRemoval	bool	false	No
+AllowSLWidening	bool	false	No
+OneXAUPositionOnly	bool	true	No
+________________________________________
+5. MULTI-TIMEFRAME LIVE DATA ENGINE
+The EA must continuously maintain current closed-bar data for:
+D1
+Macro direction and higher-timeframe context.
+H4
+Primary trend determination.
+H1
+Structural range, premium/discount and structural direction.
+M15
+Intermediate structure, confirmation context and runner management.
+M5
+Execution logic.
+The EA must explicitly read each timeframe rather than assuming data from the attached chart. The master specification requires active multi-timeframe reading and synchronization.
+Recommended structures:
+struct TFState
+{
+   ENUM_TIMEFRAMES tf;
+   datetime lastClosedBar;
+   datetime lastUpdate;
+
+   double close;
+   double atr14;
+   double ema20;
+   double ema50;
+   double adx14;
+
+   bool synchronized;
+   bool enoughBars;
+   bool valid;
+};
+Maintain:
+TFState StateD1;
+TFState StateH4;
+TFState StateH1;
+TFState StateM15;
+TFState StateM5;
+________________________________________
+6. DATA SYNCHRONIZATION GATE
+Before any strategy evaluation:
+D1 synchronized
+AND H4 synchronized
+AND H1 synchronized
+AND M15 synchronized
+AND M5 synchronized
+AND enough history available
+AND all indicator handles valid
+Otherwise:
+DATA_NOT_READY
+and:
+NO TRADE
+Use completed bars for structural decisions.
+Do not use an unfinished H1/H4/D1 candle as though it were confirmed.
+________________________________________
+7. INDICATORS
+Required handles/data:
+Indicator	TF
+EMA20	D1/H4/H1
+EMA50	D1/H4/H1
+ATR14	D1/H4/H1/M15/M5
+ADX14	H4
+RSI14	M5 if retained in scoring
+Average Candle Body 20	M5
+ATR Average 50	M5
+________________________________________
+8. D1 MACRO DIRECTION
+Bullish candidate:
+Close > EMA20 > EMA50
+Bearish:
+Close < EMA20 < EMA50
+For high-selectivity/A++ trades:
+D1 alignment becomes mandatory.
+Therefore:
+BUY requires:
+D1 = BULLISH
+SELL requires:
+D1 = BEARISH
+A conflicting D1 blocks the highest-quality production setup.
+________________________________________
+9. H4 DIRECTION ENGINE
+Bullish:
+Close > EMA20 > EMA50
+Bearish:
+Close < EMA20 < EMA50
+Mandatory separation:
+abs(EMA20 - EMA50) >= 0.15 * H4_ATR14
+Mandatory persistence:
+Same H4 direction >= 3 completed H4 candles
+Mandatory ADX:
+ADX14 >= 20
+For A++ high-selectivity mode:
+Preferred ADX >= 25
+Research tier:
+A++ preferred ADX >= 30
+The strengthened specification makes EMA separation, trend persistence, and ADX hard directional filters rather than merely scoring items.
+________________________________________
+10. H4 OVEREXTENSION FILTER
+Add production protection:
+DistanceFromEMA20 <= 2.5 * H4_ATR
+If price is excessively extended from H4 EMA20:
+TREND_OVEREXTENDED
+→ wait for retracement.
+This prevents entering late-stage momentum simply because ADX is elevated.
+This is an enhancement to be validated in optimization rather than assumed to improve performance.
+________________________________________
+11. H1 DIRECTION
+Require:
+H1 direction == H4 direction
+High-selectivity production:
+D1 == H4 == H1
+Otherwise:
+HTF_ALIGNMENT_FAILED
+________________________________________
+12. H1 DEALING RANGE
+The H1 range must:
+Age <= 40 completed H1 candles
+and:
+RangeSize >= 3.0 * H1_ATR
+Recalculate whenever a new confirmed H1 structural swing changes the active range.
+The strengthened specification explicitly rejects stale, tiny and equilibrium-centered ranges.
+________________________________________
+13. PREMIUM / DISCOUNT
+Calculate:
+RangeMid = (RangeHigh + RangeLow) / 2.0;
+RangeSize = RangeHigh - RangeLow;
+Equilibrium exclusion:
+±5% of total range around midpoint
+If price is inside that region:
+EQUILIBRIUM_NEUTRAL
+→ NO TRADE
+BUY:
+Discount only
+SELL:
+Premium only
+A++ enhancement:
+BUY preferably located in deeper discount.
+SELL preferably located in deeper premium.
+________________________________________
+14. LIQUIDITY ENGINE
+Track:
+1.	Previous Week High / Low
+2.	Previous Day High / Low
+3.	Equal Highs / Equal Lows
+4.	Asian High / Low
+5.	Confirmed H1 swings
+6.	Confirmed M15 swings
+Priority:
+PWH/PWL
+→ PDH/PDL
+→ EQH/EQL
+→ Asian H/L
+→ H1
+→ M15
+Same-tier rule:
+nearest qualifying pool
+Liquidity >10 trading days untouched:
+downgrade one tier
+Equal high/low tolerance:
+<= 0.08 * ATR
+These hierarchy and decay rules are explicitly defined in the strengthened specification.
+________________________________________
+15. LIQUIDITY OBJECT
+Recommended coding structure:
+enum LiquidityType
+{
+   LIQ_PWH,
+   LIQ_PWL,
+   LIQ_PDH,
+   LIQ_PDL,
+   LIQ_EQH,
+   LIQ_EQL,
+   LIQ_ASIA_HIGH,
+   LIQ_ASIA_LOW,
+   LIQ_H1_SWING_HIGH,
+   LIQ_H1_SWING_LOW,
+   LIQ_M15_SWING_HIGH,
+   LIQ_M15_SWING_LOW
+};
+
+struct LiquidityLevel
+{
+   LiquidityType type;
+   double price;
+   datetime created;
+   int priority;
+   bool touched;
+   bool swept;
+   bool stale;
+};
+________________________________________
+16. SWING DETECTION
+Use confirmed five-bar fractal.
+Swing High:
+High[n] > High[n-2]
+High[n] > High[n-1]
+High[n] > High[n+1]
+High[n] > High[n+2]
+Swing Low mirrored.
+Because two future bars are needed:
+Never mark the swing confirmed before those bars close.
+Amplitude:
+SwingAmplitude >= 0.20 * M5_ATR
+Below:
+MINOR_SWING
+Minor swings cannot trigger:
+•	CHoCH
+•	BOS
+•	structural SL
+•	major liquidity classification
+The amplitude rule is required by the strengthened specification.
+________________________________________
+17. SWEEP REQUIREMENTS
+Broad valid research envelope:
+0.05 ATR <= penetration <= 0.75 ATR
+Preferred production region:
+0.10 ATR <= penetration <= 0.50 ATR
+High-selectivity A++ research region:
+0.15 ATR <= penetration <= 0.40 ATR
+Reclaim mandatory.
+Sweep + reclaim must complete within:
+<= 3 M5 candles
+Slow penetration:
+BREAKOUT_NOT_SWEEP
+Do not evaluate sweep if:
+Current M5 ATR < 0.40 * ATR50Average
+The source specification requires both velocity and dead-volatility protection.
+________________________________________
+18. STRICT CHoCH
+BUY
+Required structural progression:
+LL → LH → LL
+Then:
+sell-side liquidity sweep
+Then:
+completed M5 close > protected confirmed LH
+SELL
+HH → HL → HH
+then buy-side sweep,
+then:
+completed M5 close < protected confirmed HL
+Only CONFIRMED swings are valid protection points.
+CHoCH timeout:
+24 M5 candles
+The source explicitly requires confirmed protected levels and the 24-bar timeout.
+________________________________________
+19. DISPLACEMENT
+Calculate:
+AvgBody20 = Average(abs(Close[i] - Open[i]), previous 20 M5 bars);
+Base:
+CurrentBody >= 1.25 * AvgBody20
+Preferred:
+>= 1.50
+A++ research:
+>= 1.75
+Following candle:
+retracement < 70% of displacement body/range
+Otherwise:
+DISPLACEMENT_FAILED
+The immediate follow-through requirement is part of the strengthened strategy.
+________________________________________
+20. BOS — MANDATORY
+BOS cannot be optional.
+BUY:
+completed M5 close > confirmed structural high
+SELL:
+completed M5 close < confirmed structural low
+Wick:
+does not count
+Referenced swing must have existed before CHoCH.
+BOS maximum delay:
+15 M5 candles after displacement
+CHoCH invalidated before BOS:
+RESET_SETUP
+These sequencing requirements prevent look-ahead or disconnected structural signals.
+________________________________________
+21. FAIR VALUE GAP
+Three-candle FVG.
+Minimum:
+0.05 * M5 ATR
+A++ preferred:
+>= 0.10 ATR
+Track:
+struct FVG
+{
+   bool bullish;
+   double low;
+   double high;
+   double size;
+   double mitigationPct;
+   datetime created;
+   int ageBars;
+   bool stale;
+};
+Eligibility:
+Mitigation < 50%
+At:
+>=50% = MITIGATED
+100% = FULLY_MITIGATED
+Age >50 M5 bars:
+STALE_FVG
+The source explicitly defines mitigation percentage and staleness.
+________________________________________
+22. ORDER BLOCK
+Valid OB:
+last opposite candle immediately before qualifying impulse
+Preferred consequence:
+Displacement + BOS
+Strong OB may additionally produce FVG/CHoCH.
+Track mitigation percentage.
+Age:
+>80 M5 bars = stale/deprioritized
+The source specifies the adjacent-candle tie-break and OB staleness rules.
+________________________________________
+23. FIBONACCI
+Primary:
+61.8%
+Research:
+78.6%
+Must use actual impulse associated with the CHoCH/BOS sequence.
+If a completed candle closes beyond:
+Fib 100% / sweep extreme
+then:
+SETUP_INVALID
+This invalidation condition is part of the strengthened specification.
+________________________________________
+24. ENTRY ZONE
+Baseline production:
+minimum 2 of:
+FVG
+OB
+Fib61.8
+A++ high-selectivity configuration:
+FVG + OB + Fib61.8
+All three required.
+Baseline tolerance:
+0.30 ATR
+A++ optimization candidates:
+0.10 / 0.15 / 0.20 ATR
+Do not hardcode the narrowest version until OOS testing verifies it.
+________________________________________
+25. MINIMUM STOP DISTANCE FROM ZONE
+Before activating entry zone:
+ProjectedStructuralStopDistance >= 0.50 * M5 ATR
+Otherwise:
+ZONE_TOO_CLOSE_TO_INVALIDATION
+→ reject.
+This protects against artificially tight stops and oversized calculated positions.
+________________________________________
+26. M5 ENTRY CONFIRMATION
+Valid confirmation types:
+Engulfing
+Body fully engulfs previous candle body in trade direction.
+Rejection
+Opposing wick:
+>=60% of full candle range
+with directional close near/inside zone.
+Micro-BOS
+Completed M5 close through most recent internal swing in intended direction.
+Existing production:
+one confirmation
+A++ research:
+two compatible confirmations
+Example:
+Rejection + Micro-BOS
+or:
+Engulfing + Micro-BOS
+Confirmation timeout:
+10 M5 bars
+The source defines these confirmations explicitly.
+________________________________________
+27. M15 CONFIRMATION
+New stronger filter:
+BUY must not have a confirmed M15 bearish continuation structure directly opposing the entry.
+SELL mirrored.
+A++ preference:
+M15 agrees with trade direction
+or:
+M15 neutral and transitioning toward trade
+Clear opposite M15 structure:
+M15_CONFLICT
+→ reject.
+________________________________________
+28. VOLATILITY GATE
+Mandatory current rules:
+0.60 <= M5_ATR / ATR50Average <= 2.50
+Below:
+DEAD_MARKET
+Above:
+ABNORMAL_VOLATILITY
+A++ optimization candidates:
+0.75–2.00
+0.80–1.80
+Do not deploy the narrower range until validated.
+RR and volatility are hard gates, not points.
+________________________________________
+29. SESSION ENGINE
+Asian:
+Context/liquidity only
+Default entries:
+•	London
+•	London/New York overlap
+•	New York
+Do not trade:
+30 minutes before London open
+30 minutes after NY close
+For optimization:
+Prioritize London-NY overlap as a test cohort, not as a guaranteed superior session.
+Runtime must account for broker server offset/DST.
+________________________________________
+30. NEWS ENGINE
+Block new entries around:
+•	FOMC
+•	NFP
+•	CPI
+•	Core CPI
+•	PCE
+•	Fed Chair high-impact events
+•	explicitly identified gold-sensitive scheduled releases
+Standard:
+-30 minutes / +30 minutes
+FOMC:
+-90 / +90 minutes
+The required gold-specific event list and extended FOMC blackout are already defined.
+If economic-calendar data is unavailable when a required filter should be operating:
+Production-safe option:
+NEWS_DATA_UNAVAILABLE
+→ disable new entries.
+________________________________________
+31. SPREAD GATE
+Maximum spread:
+min(
+    StaticSpreadCeiling,
+    0.15 * CurrentM5ATR
+)
+A++ research:
+dynamic threshold = 0.10 * M5 ATR
+Both static and dynamic criteria must pass.
+This volatility-relative spread control is required by the strengthened specification.
+________________________________________
+32. QUALITY CLASSIFICATION
+Recommended classes:
+Class	Score	Requirements
+A++	30–32	All mandatory high-selectivity gates
+A+	28–29	Full structural validation
+A	27	Research/shadow mode initially
+B	<27	Reject
+For initial high-selectivity live validation:
+Trade A++ only
+This is intended to pursue higher accuracy by sacrificing frequency.
+It cannot guarantee 80%.
+________________________________________
+33. HARD GATES OUTSIDE SCORE
+The following must never be compensated by points:
+Data synchronized
+Direction alignment
+Valid dealing range
+Premium/discount
+Valid sweep/reclaim
+Strict CHoCH
+Displacement
+Mandatory BOS
+RR >= 2
+Volatility gate
+Session allowed
+News clear
+Spread acceptable
+Mandatory structural SL
+Position size valid
+Exposure valid
+Margin valid
+Broker execution valid
+A 32-point score cannot override a failed hard gate.
+________________________________________
+34. RISK ENGINE
+Risk base:
+Current Equity
+Never balance.
+At each new potential entry, read fresh:
+double Equity     = AccountInfoDouble(ACCOUNT_EQUITY);
+double Balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+double FreeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+The source explicitly requires fresh live account values and equity-based sizing.
+________________________________________
+35. PROGRESSIVE RISK
+Daily Sequence	Risk
+Normal/first qualifying trade	0.25%
+After 1 loss	0.20%
+After 2 losses	0.15%
+After 3 losses	Stop trading
+After two losses also require:
+Score >=30
+A++ quality preferred
+The progressive risk cuts are defined in the strengthened specification.
+________________________________________
+36. FRIDAY RISK MODIFIER
+Six hours before broker Friday close:
+CurrentRisk *= 0.50
+Four hours before close:
+NO NEW ENTRIES
+Two hours before:
+defensive management.
+Thirty minutes before:
+close EA positions
+delete EA pending orders
+The 50% pre-weekend risk reduction is part of the strengthened specification.
+________________________________________
+37. RISK CAPITAL
+RiskCapital = CurrentEquity * RiskPct;
+Example internal representation:
+0.25% = 0.0025
+0.20% = 0.0020
+0.15% = 0.0015
+________________________________________
+38. MANDATORY STOP LOSS
+This is a permanent protected requirement.
+MandatoryStopLoss = true;
+AllowEntryWithoutSL = false;
+AllowSLRemoval = false;
+AllowSLWidening = false;
+EmergencyCloseIfSLProtectionFails = true;
+No market order may intentionally be sent with:
+SL = 0
+________________________________________
+39. STRUCTURAL SL
+BUY candidate:
+StructuralLow =
+lowest relevant of:
+Sweep Low
+OB Low
+Protected Structural Low
+Then:
+SL = StructuralLow
+     - 0.10 * M5ATR
+     - CurrentSpread
+SELL:
+StructuralHigh =
+highest relevant:
+Sweep High
+OB High
+Protected High
+then:
+SL = StructuralHigh
+     + 0.10 * M5ATR
+     + CurrentSpread
+The source requires ATR+spread buffering and broker stop-level validation.
+________________________________________
+40. SL PRE-ORDER VALIDATION
+Before order:
+SL != 0
+SL is on correct side of entry
+SL respects SYMBOL_TRADE_STOPS_LEVEL
+SL distance >= minimum strategy requirement
+Risk against SL computable
+Final RR >=2
+Failure:
+SL_VALIDATION_FAILED
+→ NO TRADE
+________________________________________
+41. NO SILENT SL WIDENING
+If broker minimum stop requirement is incompatible with structural SL:
+Do not silently push SL farther away.
+Instead:
+1.	calculate broker-compliant potential SL,
+2.	recalculate dollar risk,
+3.	recalculate lot size,
+4.	recalculate RR,
+5.	re-run exposure/margin,
+6.	execute only if the resulting setup still meets all strategy gates.
+Otherwise:
+REJECT
+________________________________________
+42. SL MUST BE ATTACHED TO ENTRY
+Order request must contain:
+request.sl = FinalStopLoss;
+The bot must not intentionally use:
+Open first → add SL later
+as normal behavior.
+________________________________________
+43. POST-FILL SL VERIFICATION
+Immediately after confirmed fill:
+Read the live broker position.
+Verify:
+POSITION_SL > 0
+and approximately equals expected protective level.
+If missing:
+UNPROTECTED_POSITION
+Attempt one controlled protective SL repair.
+If repair fails:
+Emergency protective close
+and:
+EmergencyStop = true
+This prevents an uncontrolled XAUUSD position from remaining open.
+________________________________________
+44. STOP MANAGEMENT RULE
+After entry:
+SL may:
+tighten
+but:
+never widen
+and:
+never be removed
+unless the position is simultaneously being closed.
+________________________________________
+45. AUTOMATIC POSITION SIZING
+Every single trade recalculates size.
+Never:
+FixedLots
+ManualLots
+PreviousTradeLots
+CachedLots
+The strengthened specification explicitly prohibits manual/static lot sizes.
+________________________________________
+46. SYMBOL PARAMETERS TO READ LIVE
+SYMBOL_TRADE_TICK_SIZE
+SYMBOL_TRADE_TICK_VALUE
+SYMBOL_TRADE_TICK_VALUE_PROFIT
+SYMBOL_TRADE_TICK_VALUE_LOSS
+SYMBOL_TRADE_CONTRACT_SIZE
+SYMBOL_VOLUME_MIN
+SYMBOL_VOLUME_MAX
+SYMBOL_VOLUME_STEP
+SYMBOL_TRADE_STOPS_LEVEL
+SYMBOL_ASK
+SYMBOL_BID
+SYMBOL_POINT
+Never hardcode XAUUSD dollar-per-point assumptions.
+The source explicitly requires reading the current broker contract specification.
+________________________________________
+47. PREFERRED ROBUST LOT CALCULATION
+For coding, the safest method is to determine the potential loss at SL for 1.0 lot using OrderCalcProfit().
+Example concept:
+double lossOneLot = 0.0;
+
+bool ok = OrderCalcProfit(
+   orderType,
+   symbol,
+   1.0,
+   entryPrice,
+   stopLoss,
+   lossOneLot
+);
+
+lossOneLot = MathAbs(lossOneLot);
+
+if(!ok || lossOneLot <= 0)
+    RejectTrade();
+Then:
+RawLots = RiskCapital / lossOneLot;
+This is preferable to assuming a constant XAUUSD point value because it respects the broker's symbol and account-currency mechanics.
+________________________________________
+48. LOT NORMALIZATION
+Always round down.
+Conceptually:
+FinalLots =
+   MathFloor(RawLots / VolumeStep)
+   * VolumeStep;
+Never round up.
+Example:
+Raw = 0.137
+Step = 0.01
+Final = 0.13
+Conservative downward rounding is explicitly required.
+________________________________________
+49. MINIMUM LOT RULE
+If calculated size falls below broker minimum:
+Do not automatically force VolumeMin.
+Calculate the actual risk of VolumeMin.
+If unacceptable:
+MIN_LOT_EXCEEDS_RISK_TOLERANCE
+→ reject.
+This is particularly important on small accounts.
+________________________________________
+50. ACTUAL RISK RECALCULATION
+After normalization:
+Use OrderCalcProfit() again:
+Entry → Stop
+FinalLots
+Determine:
+ActualRiskCurrency
+ActualRiskPct
+Require:
+ActualRisk <= AllowedRisk
+unless a specifically documented tiny broker rounding tolerance applies.
+Production preference:
+Never exceed configured risk.
+________________________________________
+51. OPEN-RISK EXPOSURE
+Before new trade:
+ExistingOpenRisk
++
+ProposedTradeRisk
+=
+ProjectedOpenRisk
+Require:
+ProjectedOpenRisk <= MaxPortfolioOpenRisk
+Recommended production default:
+MaxPortfolioOpenRisk = 0.50% equity
+Absolute strategy ceiling for future expanded deployment:
+0.75%
+Because the initial implementation permits only one active XAUUSD trade, most normal operation remains below this.
+________________________________________
+52. XAUUSD EXPOSURE
+Calculate current XAUUSD risk using actual open positions, not internally cached values.
+Read broker state every time.
+The source specifically requires live exposure after partial closes or manual intervention.
+________________________________________
+53. NOTIONAL EXPOSURE
+For institutional-size accounts also calculate:
+NotionalExposure
+approximately using live contract specifications:
+Lots × ContractSize × Price
+subject to symbol mechanics.
+Maintain controls:
+MaxLotsPerOrder
+MaxXAUUSDVolume
+MaxSymbolNotional
+MaxAccountNotional
+MaxBrokerExposure
+MaxMarginUtilization
+These should be broker/account operational limits rather than strategy-alpha parameters.
+________________________________________
+54. FINAL LOT CAP
+Conceptually:
+FinalLots = MIN(
+    RiskLots,
+    BrokerMaxVolume,
+    ConfiguredMaxLotsPerOrder,
+    RemainingSymbolExposure,
+    RemainingAccountExposure,
+    MarginAllowedLots,
+    LiquidityExecutionLimit
+)
+Then:
+round down again
+and recalculate actual risk.
+The source specifies this exposure-cap chain.
+________________________________________
+55. MARGIN CHECK
+Use:
+OrderCalcMargin(...)
+Require:
+MarginRequired <= FreeMargin × MarginSafetyFactor
+Default:
+MarginSafetyFactor = 0.80
+The source explicitly defines the 80% margin safety concept.
+________________________________________
+56. RR GATE
+Before execution:
+RR >= 2.0
+Hard gate.
+For standard two-R target:
+RewardDistance >= 2 × RiskDistance
+Do not count RR as score.
+If:
+RR < 2
+then:
+NO TRADE
+________________________________________
+57. FINAL EXECUTION RECHECK
+Immediately before OrderSend():
+Read again:
+Bid
+Ask
+Spread
+Equity
+Free Margin
+Existing Position
+Open Exposure
+Stops level
+Then recalculate:
+Entry
+SL distance
+Risk
+Lots
+Margin
+RR
+Spread
+This protects against price changes occurring between confirmation candle close and actual submission.
+________________________________________
+58. EXECUTION PRICE
+BUY sizing:
+current Ask
+SELL sizing:
+current Bid
+Do not calculate live risk from historical confirmation candle close.
+________________________________________
+59. ORDER REQUEST REQUIREMENTS
+Order request shall include at minimum:
+Symbol
+Direction
+Final Volume
+Current market price / market order logic
+Mandatory SL
+TP where supported by strategy
+Deviation/slippage control
+Magic Number
+Strategy comment / SetupID
+________________________________________
+60. SETUP ID
+Recommended:
+Symbol
++
+Direction
++
+LiquidityType
++
+LiquidityTimestamp
++
+CHoCHTimestamp
++
+BOSTimestamp
+Hash/string representation:
+SetupID
+After execution:
+CONSUMED
+Never execute it again.
+________________________________________
+61. DUPLICATE ENTRY PROTECTION
+Before order:
+SetupID not consumed
+No active order for SetupID
+No active position for SetupID
+Cooldown satisfied
+Otherwise reject.
+________________________________________
+62. ONE POSITION DEFAULT
+Production:
+One active XAUUSD position at a time
+Maximum 3 trades/day means:
+three sequential independent setups
+not three simultaneous stacked positions.
+________________________________________
+63. PROFIT MANAGEMENT
+Baseline:
+TP1
++1R
+close 30%
+TP2
++2R
+close 40%
+Runner
+30%
+If volume-step rules make partials impossible, follow the fallback logic required by the strengthened spec.
+________________________________________
+64. PARTIAL-CLOSE FALLBACK
+If 30% volume < allowable broker minimum/step:
+Skip TP1 partial.
+Roll it into TP2.
+Then:
+70% at TP2
+30% runner
+If even this cannot be cleanly executed:
+close full position at TP2
+Log:
+PARTIAL_CLOSE_VOLUME_FALLBACK
+Never silently fail.
+________________________________________
+65. BREAKEVEN
+After TP2:
+Runner protection:
+BE + spread buffer
+not exact entry.
+Then use M15 structure.
+BUY:
+trail under confirmed M15 HL.
+SELL:
+trail above confirmed M15 LH.
+________________________________________
+66. EARLY EXIT / STALLED POSITION
+After:
+20 M5 candles
+if price remains between:
+entry and +1R
+mark:
+STALLED
+Default:
+do not force exit solely due to time
+The strengthened spec treats this as a monitoring condition.
+________________________________________
+67. DAILY TRADE CONTROL
+MaxTradesPerDay = 3
+Do not force trades.
+Valid daily result:
+0
+1
+2
+or 3 trades
+After any close:
+Cooldown = 6 M5 candles
+Next setup requires:
+different liquidity event
+AND
+different CHoCH timestamp
+The source explicitly requires setup independence and cooldown.
+________________________________________
+68. DAILY LOSS PROTECTION
+Suggested retained values:
+Normal Daily Soft Stop = -0.75%
+Emergency Daily Stop = -2.00%
+Weekly Stop = -4.00%
+Monthly Stop = -6.00%
+When the relevant threshold triggers:
+EmergencyStop = true;
+No new entries.
+The strengthened specification links loss-limit breaches directly to the emergency stop.
+________________________________________
+69. EQUITY BASELINES
+Capture:
+DailyBaselineEquity
+WeeklyBaselineEquity
+MonthlyBaselineEquity
+on first valid tick following the relevant rollover.
+Do not continually move the baseline higher/lower during the period.
+This is explicitly required to prevent the drawdown limit resetting itself.
+________________________________________
+70. CONSECUTIVE LOSS LOGIC
+Three losses at default risk:
+0.25 + 0.20 + 0.15 = 0.60%
+This remains below normal:
+0.75% daily soft stop
+Add configuration sanity check at initialization.
+The source explicitly requires this consistency test.
+________________________________________
+71. WIN STREAK
+No increased risk after wins.
+Always cap normal per-trade risk at:
+0.25%
+No anti-martingale.
+________________________________________
+72. FRIDAY/WEEKEND SAFETY
+Broker-close-relative:
+T-6h → risk × 50%
+T-4h → no new entries
+T-2h → protect existing trade
+T-30m → flatten EA positions and cancel pending
+Weekend → trading disabled
+________________________________________
+73. MONDAY REOPENING
+After broker market reopens:
+Wait:
+2 completed M15 candles
+Require:
+spread normal
+series synchronized
+structure initialized
+no news blackout
+connection valid
+Then allow scanning.
+________________________________________
+74. CONNECTION MONITOR
+Check:
+Terminal connected
+Broker/account connected
+Symbol synchronized
+Trading allowed
+Algo Trading enabled
+Ticks recent
+Trade context operational
+No new entries if connection state is unreliable.
+________________________________________
+75. RECONCILIATION
+On:
+•	OnInit
+•	reconnect
+•	terminal/VPS restart
+•	trade transaction
+•	periodic health check
+read broker positions/orders.
+Internal state must be reconciled to broker reality.
+________________________________________
+76. ORPHAN POSITION
+If:
+MagicNumber matches
+Symbol matches
+No corresponding internal journal record
+then:
+ORPHANED_POSITION
+Default:
+•	no new scaling
+•	defensive structural management
+•	alert
+•	new entries disabled until reconciliation
+The source requires orphan handling rather than silently assuming state.
+________________________________________
+77. ORDER FAILURE CIRCUIT BREAKER
+Track rejected orders.
+If:
+5 consecutive order rejections
+within rolling 30 minutes
+then:
+EmergencyStop = true;
+Manual review required.
+This is explicitly required by the strengthened specification.
+________________________________________
+78. EMERGENCY FLAGS
+Use separate concepts:
+bool EmergencyStop;
+bool EmergencyFlatten;
+EmergencyStop
+blocks new entries.
+EmergencyFlatten
+closes existing strategy positions according to emergency policy.
+Do not conflate them.
+________________________________________
+79. STATE MACHINE
+Recommended enum:
+enum StrategyState
+{
+   STATE_IDLE,
+   STATE_HTF_VALID,
+   STATE_LIQUIDITY_IDENTIFIED,
+   STATE_SWEEP_CONFIRMED,
+   STATE_CHOCH_CONFIRMED,
+   STATE_DISPLACEMENT_CONFIRMED,
+   STATE_BOS_CONFIRMED,
+   STATE_ENTRY_ZONE_CREATED,
+   STATE_WAITING_RETRACE,
+   STATE_ENTRY_CONFIRMATION,
+   STATE_SCORE_VALID,
+   STATE_RISK_VALID,
+   STATE_ORDER_SENT,
+   STATE_POSITION_MANAGEMENT,
+   STATE_TP1,
+   STATE_TP2,
+   STATE_RUNNER,
+   STATE_POSITION_CLOSED,
+   STATE_EMERGENCY_STOP
+};
+________________________________________
+80. STATE TIMEOUTS
+State Transition	Maximum M5 Bars
+Liquidity → Sweep	100
+Sweep → CHoCH	24
+CHoCH → Displacement	10
+Displacement → BOS	15
+BOS → Entry Zone	5
+Retrace → Confirmation	10
+Confirmation → Order	1
+These are authoritative strengthened timeouts.
+On timeout:
+STATE_TIMEOUT
+Reset safely to:
+LIQUIDITY_IDENTIFIED
+where appropriate.
+________________________________________
+81. SETUP CONTEXT STRUCTURE
+Recommended:
+struct SetupContext
+{
+   string setupID;
+
+   int direction;
+
+   StrategyState state;
+
+   LiquidityLevel liquidity;
+
+   datetime sweepTime;
+   double sweepExtreme;
+
+   datetime chochTime;
+   double protectedLevel;
+
+   datetime displacementTime;
+
+   datetime bosTime;
+   double bosLevel;
+
+   FVG fvg;
+
+   double obHigh;
+   double obLow;
+
+   double fib618;
+   double fib100;
+
+   double zoneHigh;
+   double zoneLow;
+
+   datetime confirmationTime;
+
+   int qualityScore;
+
+   double entry;
+   double sl;
+   double tp1;
+   double tp2;
+
+   double riskPct;
+   double riskCapital;
+
+   double rawLots;
+   double finalLots;
+
+   double actualRisk;
+   double rr;
+
+   bool consumed;
+};
+________________________________________
+82. OPERATIONAL INPUTS
+These can remain configurable.
+Input	Purpose
+BrokerSymbol	XAUUSD broker suffix mapping
+MagicNumber	Strategy identification
+MaxAbsoluteSpread	Broker-specific hard ceiling
+MaxSlippagePoints	Execution tolerance
+BrokerFridayCloseTime	Weekend management
+MaxLotsPerOrder	Institutional/order safety
+MaxXAUVolume	Symbol exposure ceiling
+MaxPortfolioOpenRiskPct	Portfolio risk ceiling
+MarginSafetyFactor	Default 0.80
+EnableNotifications	Operational
+EnableFileLogging	Audit
+EnableVerboseJournal	Development
+EmergencyFlattenPolicy	Operational safety
+These are not intended to change the trading edge.
+________________________________________
+83. PRODUCTION-LOCKED INPUTS
+Do not expose normal editable controls for:
+EMA periods
+ATR period
+ADX period
+minimum ADX
+HTF timeframes
+CHoCH rules
+BOS rules
+sweep thresholds
+FVG definition
+OB definition
+Fib definition
+SL requirement
+risk tiers
+RR minimum
+state timeouts
+daily maximum trades
+loss-stop structure
+TP percentages
+Changing those should require:
+new strategy version + new validation cycle
+rather than casual EA input changes.
+________________________________________
+84. AUDIT LOG
+Every setup — including rejected ones — should log:
+Timestamp
+SetupID
+State
+D1/H4/H1 direction
+M15 context
+Liquidity type/price
+Sweep penetration
+CHoCH details
+Displacement ratio
+BOS
+FVG
+OB
+Fib
+Confirmation type
+Score
+ATR regime
+Session
+News status
+Spread
+Equity
+Balance
+Free margin
+Risk %
+Risk currency
+Entry
+SL
+Stop distance
+Loss/1 lot
+Raw lot
+Normalized lot
+Existing exposure
+Projected exposure
+Margin required
+RR
+Final decision
+Rejection reason
+Order ticket
+Fill price
+Slippage
+Post-fill SL verification
+TP1
+TP2
+Runner
+Final P/L
+Final R
+The strengthened specification explicitly requires auditability of the automatic sizing calculation and all major risk inputs.
+________________________________________
+85. STANDARD REJECTION CODES
+Recommended:
+DATA_NOT_READY
+TF_NOT_SYNCHRONIZED
+H4_NEUTRAL
+D1_CONFLICT
+H1_CONFLICT
+ADX_TOO_LOW
+EMA_SEPARATION_FAIL
+H1_RANGE_STALE
+H1_RANGE_TOO_SMALL
+EQUILIBRIUM_ZONE
+NO_VALID_LIQUIDITY
+SWEEP_TOO_SMALL
+SWEEP_TOO_DEEP
+SWEEP_TOO_SLOW
+CHOCH_TIMEOUT
+CHOCH_INVALID
+DISPLACEMENT_WEAK
+DISPLACEMENT_RETRACED
+BOS_TIMEOUT
+BOS_INVALID
+FVG_INVALID
+FVG_MITIGATED
+OB_INVALID
+FIB_INVALIDATED
+ENTRY_ZONE_INVALID
+CONFIRMATION_TIMEOUT
+M15_CONFLICT
+RR_BELOW_MINIMUM
+VOLATILITY_TOO_LOW
+VOLATILITY_TOO_HIGH
+SESSION_BLOCKED
+NEWS_BLACKOUT
+SPREAD_TOO_WIDE
+COOLDOWN_ACTIVE
+MAX_TRADES_REACHED
+DAILY_STOP_ACTIVE
+WEEKLY_STOP_ACTIVE
+MONTHLY_STOP_ACTIVE
+FRIDAY_CUTOFF
+MANDATORY_SL_INVALID
+MIN_LOT_EXCEEDS_RISK
+EXPOSURE_LIMIT
+MARGIN_INSUFFICIENT
+ORDER_REJECTED
+UNPROTECTED_POSITION
+ORPHANED_POSITION
+EMERGENCY_STOP
+STATE_TIMEOUT
+________________________________________
+86. MAIN EVENT ARCHITECTURE
+Recommended MQL5 components:
+OnInit()
+OnDeinit()
+OnTick()
+OnTimer()
+OnTradeTransaction()
+OnInit()
+•	validate account/symbol
+•	create indicator handles
+•	load strategy state
+•	set timer
+•	reconcile positions
+•	load rollover baselines
+•	check production configuration
+•	ensure risk sanity
+OnTick()
+Fast checks only:
+•	new tick
+•	spread
+•	open-position protection
+•	emergency conditions
+•	order/position management
+•	detect new M5 bar
+Do not recompute every H4/D1 indicator on every tick unnecessarily.
+New M5 bar
+Run strategy state machine.
+New M15/H1/H4/D1 bars
+Update only the relevant timeframe state.
+________________________________________
+87. HIGH-LEVEL PSEUDOCODE
+ON EVERY TICK:
+
+    VerifyConnection()
+
+    ReconcileIfRequired()
+
+    ManageOpenPosition()
+
+    VerifyMandatorySLProtection()
+
+    CheckEmergencyLimits()
+
+    if EmergencyStop:
+        return
+
+    if not NewM5Bar:
+        return
+
+    RefreshM5()
+
+    if NewM15Bar:
+        RefreshM15()
+
+    if NewH1Bar:
+        RefreshH1()
+
+    if NewH4Bar:
+        RefreshH4()
+
+    if NewD1Bar:
+        RefreshD1()
+
+    if !AllTimeframesSynchronized:
+        reject DATA_NOT_READY
+
+    if WeekendBlocked:
+        reject
+
+    UpdateDirectionEngine()
+
+    if !D1_H4_H1_Aligned:
+        reject
+
+    if !H1RangeValid:
+        reject
+
+    UpdateLiquidityMap()
+
+    AdvanceStrategyStateMachine()
+
+    if SetupNotConfirmed:
+        return
+
+    if !M15ContextPass:
+        reject
+
+    if !SessionPass:
+        reject
+
+    if !NewsPass:
+        reject
+
+    if !VolatilityPass:
+        reject
+
+    if !SpreadPass:
+        reject
+
+    ScoreSetup()
+
+    if HighSelectivityMode && Score < 30:
+        reject
+
+    FinalizeStructuralSL()
+
+    if !SLValid:
+        reject
+
+    CalculateRR()
+
+    if RR < 2:
+        reject
+
+    ReadLiveAccountState()
+
+    DetermineRiskTier()
+
+    CalculateRiskCapital()
+
+    CalculateRiskPerOneLotUsingOrderCalcProfit()
+
+    NormalizeLotsDown()
+
+    CalculateCurrentOpenExposure()
+
+    ApplyExposureLimits()
+
+    VerifyMargin()
+
+    ReReadAskBid()
+
+    RecalculateEntrySLRiskRRSpread()
+
+    if any final gate fails:
+        reject
+
+    SendOrderWithSL()
+
+    VerifyFill()
+
+    VerifySLAttached()
+
+    if SL missing:
+        RepairSL()
+
+    if repair fails:
+        EmergencyClose()
+        EmergencyStop = true
+________________________________________
+88. MANDATORY FINAL PRE-TRADE CHECKLIST
+All must equal TRUE:
+[ ] D1 synchronized
+[ ] H4 synchronized
+[ ] H1 synchronized
+[ ] M15 synchronized
+[ ] M5 synchronized
+
+[ ] D1 direction valid
+[ ] H4 direction valid
+[ ] H4 persistence valid
+[ ] H4 ADX valid
+[ ] H4 separation valid
+[ ] H1 aligned
+[ ] H1 dealing range valid
+[ ] premium/discount valid
+
+[ ] qualifying liquidity
+[ ] valid sweep
+[ ] valid reclaim
+[ ] strict CHoCH
+[ ] displacement
+[ ] follow-through
+[ ] mandatory BOS
+
+[ ] valid FVG
+[ ] valid OB
+[ ] Fib valid
+[ ] entry-zone confluence
+
+[ ] M5 confirmation
+[ ] M15 confirmation/context
+[ ] score requirement
+
+[ ] RR >= 2
+[ ] volatility normal
+[ ] valid session
+[ ] news clear
+[ ] spread acceptable
+
+[ ] daily limits clear
+[ ] weekly limits clear
+[ ] monthly limits clear
+[ ] cooldown complete
+[ ] maximum trades not reached
+[ ] weekend rules clear
+
+[ ] current equity read
+[ ] current free margin read
+[ ] mandatory SL finalized
+[ ] SL broker-valid
+[ ] risk capital calculated
+[ ] exact lot calculated
+[ ] lot rounded down
+[ ] actual risk recalculated
+[ ] open-risk exposure valid
+[ ] notional exposure valid
+[ ] margin valid
+[ ] final RR valid
+
+[ ] SL included in order
+Only then:
+ORDER_SEND_ALLOWED = TRUE
+________________________________________
+89. POST-ORDER CHECKLIST
+After fill:
+[ ] ticket confirmed
+[ ] direction correct
+[ ] volume correct
+[ ] fill price recorded
+[ ] slippage recorded
+[ ] SL exists
+[ ] SL is on correct side
+[ ] TP management initialized
+[ ] SetupID consumed
+[ ] trade counter updated
+[ ] state journal saved
+If SL is missing:
+UNPROTECTED_POSITION
+→ immediate protection attempt.
+If unsuccessful:
+EMERGENCY_CLOSE
+________________________________________
+90. 80% TARGET OPTIMIZATION PARAMETERS
+These are research parameters, not necessarily production inputs.
+Test systematically:
+Variable	Candidate Values
+Score	27–32
+ADX	20 / 25 / 30 / 35
+Displacement	1.25 / 1.50 / 1.75 / 2.00
+Sweep Min	.05 / .10 / .15
+Sweep Max	.40 / .50 / .75
+Confluence	2/3 vs 3/3
+D1	scoring vs mandatory
+Confirmation	1 vs 2
+M15 agreement	optional vs mandatory
+Zone tolerance	.10/.15/.20/.30 ATR
+ATR regime	60–250 / 75–200 / 80–180
+Spread	15% vs 10% ATR
+Sessions	London / overlap / NY
+Do not choose parameters based on win rate alone.
+________________________________________
+91. OPTIMIZATION OBJECTIVE
+A useful composite optimization objective should reward:
+OOS expectancy
+Profit Factor
+Win Rate
+Trade count
+Drawdown
+Stability between periods
+and penalize:
+parameter sensitivity
+low sample size
+profit concentration
+large drawdowns
+large execution sensitivity
+The objective is not:
+“find the combination with the highest historical win rate.”
+The objective is:
+find a stable region that maintains strong expectancy and risk characteristics across unseen periods.
+________________________________________
+92. MINIMUM PRODUCTION VALIDATION
+Before considering production live-ready:
+Historical backtest
+Out-of-sample
+Walk-forward
+Monte Carlo
+Spread stress
+Slippage stress
+Latency assumptions
+Broker execution stress
+Demo-forward
+Small-live verification
+Minimum:
+100 combined OOS + walk-forward trades
+Concentration:
+No trade >15% OOS net profit
+No month >30% OOS net profit
+Required metrics:
+Trade count
+Win rate
+Average R
+Profit Factor
+Sharpe
+Sortino
+Maximum Drawdown
+Net return
+Worst losing streak
+Average winner
+Average loser
+Slippage
+Spread cost
+These requirements are part of the strengthened acceptance framework.
+________________________________________
+93. HIGH-SELECTIVITY ACCEPTANCE TARGET
+Research objective:
+Win Rate target: 75%–80%
+Preferred supporting metrics:
+PF >= 2.0
+Average R > +0.30R
+Positive OOS
+Positive walk-forward
+Max DD <10%
+But do not reject a statistically superior 72% system solely because it fails to display “80%” if it has better expectancy and robustness.
+Likewise, reject an 80% system if its winners are tiny, losses are large, or OOS performance collapses.
+________________________________________
+94. DOCUMENTATION-SAFE PERFORMANCE LANGUAGE
+Use:
+Performance Objective: SYMMETRIX GOLD SMC is engineered to apply a high-selectivity automated trading framework. Research and optimization may target a historical and validated win-rate range approaching 75%–80%; however, this target is not a promise, representation or guarantee of future performance.
+Do not use:
+Guaranteed 80% winning EA.
+________________________________________
+95. STOP-LOSS DISCLOSURE
+Use:
+Mandatory Protective Stop: Every position initiated by the EA is required to include a predefined protective stop-loss based on the strategy's structural invalidation logic. The system does not intentionally initiate unprotected trades. A stop-loss is intended to limit risk but cannot guarantee execution at the requested price during gaps, spread expansion, extreme volatility, liquidity disruption, connectivity problems or other exceptional execution conditions.
+________________________________________
+96. AUTOMATIC SIZING DISCLOSURE
+Use:
+Automatic Position Sizing: The EA determines position size from current account equity, active strategy risk tier, structural stop distance, live broker symbol specifications, current exposure and available margin. Position-sizing controls reduce manual sizing errors but cannot eliminate market or execution risk.
+This matches the source requirement that every trade's lot size be recomputed from current live account and broker state rather than fixed manually.
+________________________________________
+97. MULTI-TIMEFRAME DISCLOSURE
+Use:
+Multi-Timeframe Analysis: The EA evaluates D1, H4, H1, M15 and M5 information according to predefined rules. Agreement among these timeframes is used as a selection filter and does not guarantee that the identified market direction will continue.
+________________________________________
+98. RISK DISCLOSURE
+Use:
+Risk Disclosure: XAUUSD and other leveraged instruments can produce substantial losses. Risk limits, stop-loss orders, exposure controls, margin safeguards and emergency protections are intended to reduce risk under normal conditions but cannot guarantee a maximum loss during price gaps, extreme volatility, execution failure or extraordinary market events.
+________________________________________
+99. BACKTEST DISCLOSURE
+Use:
+Backtesting Notice: Backtested and simulated performance is hypothetical and does not represent actual trading. Historical results may not be repeated in future markets. Live results can differ due to spreads, commissions, swaps, liquidity, slippage, latency, broker execution, rejected orders, outages and market gaps.
+________________________________________
+100. MONTE CARLO DISCLOSURE
+Use:
+Monte Carlo Notice: Monte Carlo analysis models potential outcome distributions using historical or assumed trade behavior. It is a statistical stress-testing tool and is not a forecast or guarantee of future account values, returns, win rates or drawdowns.
+________________________________________
+101. FINAL CODING PRINCIPLE
+The production bot should enforce the following hierarchy:
+PROTECT CAPITAL
+↓
+VALIDATE MARKET CONTEXT
+↓
+WAIT FOR STRUCTURAL SETUP
+↓
+REQUIRE HIGH-QUALITY CONFLUENCE
+↓
+REQUIRE MANDATORY STOP LOSS
+↓
+CALCULATE EXACT RISK
+↓
+CONTROL TOTAL EXPOSURE
+↓
+VERIFY EXECUTION CONDITIONS
+↓
+EXECUTE ONLY WHEN EVERYTHING PASSES
+
+The strategy parameters themselves remain fixed while the EA dynamically adapts to equity, broker contract terms, stop distance, margin, spread and existing exposure. That principle is already central to the master production specification.
+Final production rule
+
+The programmer should treat every rule marked mandatory, hard gate, protected, or production locked as non-optional.
+There must be no code path capable of intentionally creating an XAUUSD trade without a valid SL, valid position size, acceptable risk, acceptable exposure, sufficient margin, RR ≥2 and a completely validated multi-timeframe setup.
+That is the specification I would use as the authoritative coding blueprint for SYMMETRIX GOLD SMC v3.0.
+
+
