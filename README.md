@@ -1,3 +1,9 @@
+Ophireum Multimedia Productions
+Mobile: +63 917 999 8814
+Email: dhenzecapital@gmail.com
+Telegram: @Mkogexchange
+WhatsApp: +63 995 715 1043
+
 SYMMETRIX GOLD SMC
 
 A high-selectivity, multi-timeframe XAUUSD trading system for MetaTrader 5, engineered around Smart Money Concepts, liquidity events, market structure, and strict risk controls.
