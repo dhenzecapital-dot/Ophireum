@@ -1,72 +1,21 @@
-
-
 SYMMETRIX GOLD SMC
 
 A high-selectivity, multi-timeframe XAUUSD trading system for MetaTrader 5, engineered around Smart Money Concepts, liquidity events, market structure, and strict risk controls.
 
-Status: Production candidate specification — validation and broker-specific integration are still required before live deployment.
+Status: Production candidate specification — validation and broker-specific integration are still required before live deploymen
 
 Document Purpose
 
 This document is the authoritative high-level reference for the strategy owner, MQL5 developers, Python engineers, quantitative reviewers, testers, deployment operators, and compliance reviewers working on SYMMETRIX GOLD SMC.
 
 It defines:
-
 the economic and structural logic of the trading strategy;
-
 the required software architecture and module boundaries;
-
 mandatory entry, sizing, execution, and risk-control rules;
-
 state transitions, invalidation rules, and failure behavior;
-
 audit, testing, validation, and production-acceptance requirements; and
-
 the limitations and disclosures that must accompany any performance presentation.
 
-This README does not replace source-level API documentation, unit-test specifications, release notes, broker configuration records, or validation reports. Those artifacts should be maintained separately and versioned with the production code.
-
-Table of Contents
-
-Overview
-
-System Profile
-
-Core Design Principles
-
-Strategy Workflow
-
-Entry Model
-
-Market Direction and Structure
-
-Liquidity Model
-
-Mandatory Risk Controls
-
-Stop-Loss and Position Management
-
-Session, Volatility, and News Protection
-
-Software Architecture
-
-Programming Requirements
-
-Reference MQL5 Implementation
-
-State Expiration Rules
-
-Installation
-
-Configuration
-
-Logging and Auditability
-
-Testing and Validation
-
-Production Deployment
-
-Performance and Risk Disclosures
 
 Overview
 
@@ -162,7 +111,7 @@ Production lock
 
 Enabled
 
-Core Design Principles
+ore Design Principles
 
 The system enforces the following hierarchy:
 
@@ -701,7 +650,7 @@ It is intentionally a framework, not a claim of a completed profitable EA. The s
 
 Main Expert Advisor: SymmetrixGoldSMC.mq5
 
-#property strict
+property strict
 #property version   "3.00"
 #property description "SYMMETRIX GOLD SMC — production-candidate framework"
 
@@ -1687,3 +1636,4 @@ Email: dhenzecapital@gmail.com
 Telegram: @Mkogexchange
 
 WhatsApp: +63 995 715 1043
+
